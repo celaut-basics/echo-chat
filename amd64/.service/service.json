@@ -1,0 +1,30 @@
+{
+    "tag": "echo-chat",
+    "architecture": "linux/amd64",
+    "init": {
+        "entry_path": ["entrypoint.sh"]
+    },
+    "api": [
+        {
+            "port": 8080,
+            "transport": "tcp",
+            "protocol_stack": [
+                ["http"],
+                {
+                    "tags": ["chat"],
+                    "prose": "Echo service of the chat convention of chatui (docs/celaut/chat.md). The answer to each message is the text of the message. One instance is one conversation."
+                }
+            ]
+        }
+    ],
+    "resources": {
+        "at_init": {
+            "mem_limit": 134217728,
+            "disk_space": 256000000
+        },
+        "at_most": {
+            "mem_limit": 268435456,
+            "disk_space": 256000000
+        }
+    }
+}
