@@ -20,6 +20,7 @@ MAX_TEXT = 16_384
 MAX_BODY = 24 << 20
 MAX_FILE = 4 << 20
 MAX_FILES = 4
+MAX_ANSWER = 1 << 20  # body of the answer to a read (chat.md revision 4)
 MAX_FILE_BYTES = 64 << 20  # all files of the history; above it, history_full
 ACCEPTS = ["image", "audio"]
 MIME_KINDS = {"image/jpeg": "image", "image/png": "image",
@@ -151,6 +152,22 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _page(self, start):
+        """The messages from `start`, as many as fit in MAX_ANSWER, at least one.
+
+        The caller holds the data lock. The size is that of the JSON that _send makes.
+        """
+        header = len(json.dumps({"count": self.chat.count, "accepts": ACCEPTS,
+                                 "messages": []}).encode())
+        used = header
+        page = []
+        for message in self.chat.messages[start:]:
+            used += len(json.dumps(message).encode()) + 2  # ", " between messages
+            if page and used > MAX_ANSWER:
+                break
+            page.append(message)
+        return page
+
     def do_GET(self):
         url = urlsplit(self.path)
         found = ATTACHMENT.fullmatch(url.path)
@@ -169,7 +186,7 @@ class Handler(BaseHTTPRequestHandler):
             if start > self.chat.count:
                 return self._error(400, "bad_request", "from is more than count")
             self._send(200, {"count": self.chat.count, "accepts": ACCEPTS,
-                             "messages": self.chat.messages[start:]})
+                             "messages": self._page(start)})
 
     def do_POST(self):
         path = urlsplit(self.path).path

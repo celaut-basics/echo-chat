@@ -4,7 +4,7 @@ An echo service that follows the chat convention of chatui
 ([docs/celaut/chat.md](https://github.com/celaut-project/chatui/blob/master/docs/celaut/chat.md)).
 It is the check of milestone M4: the answer to each message is the text of the message.
 
-It follows revision 3 of `chat.md` (2026-10-22, ASD-STE100), with attachments.
+It follows revision 4 of `chat.md` (2026-10-22, ASD-STE100), with attachments.
 The service ignores the content of files: it accepts, validates, keeps and gives
 back each file, but it never reads or interprets a file. The answer is the echo
 of `text` only and has no attachment.
@@ -16,7 +16,7 @@ One HTTP slot on `:8080` (the `PORT` variable changes it).
 | Request | Meaning |
 |---|---|
 | `POST /chat/messages` with `{"expect": N, "text": "...", "attachments": [...]}` | Add a user message and its echo. `expect` is the `count` that the client believes the service has. `attachments` is optional |
-| `GET /chat/messages?from=N` | The messages with `seq` of N or more, `count` and `accepts` (`["image", "audio"]`) |
+| `GET /chat/messages?from=N` | The messages with `seq` of N or more, `count` and `accepts` (`["image", "audio"]`). The body is 1 MiB or less: if the messages from N are more, the answer has fewer messages, in order from N, at least one. `count` is always the total |
 | `GET /chat/messages/{seq}/attachments/{index}` | The bytes of a file of a user message, with its `Content-Type` |
 
 Status codes: 200, 400 `bad_request`, 404 `not_found`, 405 `method_not_allowed`,
@@ -27,7 +27,7 @@ files), 415 `unsupported_media`, 503 `busy`.
 
 An attachment is `{"mime", "name"?, "data"}` with `data` in base64. The service accepts
 `image/jpeg`, `image/png`, `audio/mpeg` and `audio/wav` (other types: 415), up to 4 files
-of 4 MiB each and a body of 24 MiB. `text` can be empty if there is a file. The user
+of 4 MiB each and a body of 24 MiB (the minimum is 128 KiB for text only). `text` can be empty if there is a file. The user
 message lists each file as `{kind, mime, name?, size}` without `data`. The service keeps
 the files in memory and gives them back at the path above. The file is checked (base64,
 size, type) and never read: the echo does not depend on it.
@@ -118,5 +118,5 @@ clean registry. Import it with `nodo import <file>`.
     python3 -m unittest discover -s tests -t .
 
 `tests/test_server.py` tests the server, with the conformance tests 15 and 19 to 26 of
-`chat.md` for the files. `tests/test_layout.py` and
+`chat.md` for the files and a test of the 1 MiB limit of a read. `tests/test_layout.py` and
 `tests/test_manifest.py` check the pack roots without a node.

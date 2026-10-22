@@ -197,6 +197,26 @@ class AttachmentTest(ServerCase):
         self.assertEqual(body["accepts"], ["image", "audio"])
         self.assertEqual(body["messages"], [])
 
+    def test_a_read_answer_is_at_most_1_mib_and_the_client_reads_the_rest(self):
+        text = "\U0001F600" * 4096  # 16 384 bytes; 12 bytes each in JSON: worst case
+        for _ in range(40):
+            self.chat.add("user", text)
+        self.assertGreater(len(json.dumps(self.chat.messages)), 1 << 20)
+        start, seen = 0, []
+        while start < self.chat.count:
+            self.conn.request("GET", "/chat/messages?from=%d" % start)
+            response = self.conn.getresponse()
+            raw = response.read()
+            self.assertEqual(response.status, 200)
+            self.assertLessEqual(len(raw), 1 << 20)
+            body = json.loads(raw)
+            self.assertEqual(body["count"], 40)
+            self.assertEqual(body["accepts"], ["image", "audio"])
+            self.assertGreaterEqual(len(body["messages"]), 1)
+            seen += [m["seq"] for m in body["messages"]]
+            start = seen[-1] + 1
+        self.assertEqual(seen, list(range(40)))
+
     def test_20_send_only_a_file(self):
         status, body = self.send_files(0, [self.png()])
         self.assertEqual(status, 200)
