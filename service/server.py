@@ -34,7 +34,8 @@ class Chat:
         self.files = {}  # seq -> list of the bytes of each attachment
         self.file_bytes = 0
         self.max_messages = max_messages
-        self.lock = threading.Lock()
+        self.lock = threading.Lock()  # the data, held for a short time
+        self.sending = threading.Lock()  # one send in progress; never held by a read
 
     @property
     def count(self):
@@ -158,9 +159,10 @@ class Handler(BaseHTTPRequestHandler):
         if url.path != "/chat/messages":
             return self._error(404, "not_found")
         start = 0
-        if "from" in parse_qs(url.query):
-            raw = parse_qs(url.query)["from"][0]
-            if not raw.isdigit():
+        query = parse_qs(url.query, keep_blank_values=True)
+        if "from" in query:
+            raw = query["from"][0]
+            if not _digits(raw):
                 return self._error(400, "bad_request", "from is not valid")
             start = int(raw)
         with self.chat.lock:
@@ -180,6 +182,24 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             length = -1
         if not 0 <= length <= MAX_BODY:
+            if length > MAX_BODY:
+                # Read and drop the body, so the connection stays in step. A very
+                # large body is not read: the connection closes after the answer.
+                if length <= 4 * MAX_BODY:
+                    self.connection.settimeout(2)
+                    try:
+                        remaining = length
+                        while remaining:
+                            chunk = self.rfile.read(min(remaining, 1 << 20))
+                            if not chunk:
+                                break
+                            remaining -= len(chunk)
+                    except OSError:
+                        self.close_connection = True
+                    finally:
+                        self.connection.settimeout(None)
+                else:
+                    self.close_connection = True
             return self._error(400, "bad_request", "the body size is not valid")
         raw = self.rfile.read(length)
         try:
@@ -203,21 +223,25 @@ class Handler(BaseHTTPRequestHandler):
         for f in files:
             f["description"] = {"kind": MIME_KINDS[f["description"]["mime"]],
                                 **f["description"]}
-        if not self.chat.lock.acquire(blocking=False):
+        if not self.chat.sending.acquire(blocking=False):
             return self._error(503, "busy")
         try:
-            if body["expect"] != self.chat.count:
-                return self._error(409, "out_of_sync", count=self.chat.count)
-            if (self.chat.count + 2 > self.chat.max_messages
-                    or self.chat.file_bytes + sum(len(f["data"]) for f in files)
-                    > MAX_FILE_BYTES):
-                return self._error(413, "history_full",
-                                   "start a new instance for a new conversation")
-            user = self.chat.add("user", body["text"], files)
-            reply = self.chat.add("assistant", self.chat.answer(body["text"]))
-            self._send(200, {"count": self.chat.count, "messages": [user, reply]})
+            with self.chat.lock:
+                if body["expect"] != self.chat.count:
+                    return self._error(409, "out_of_sync", count=self.chat.count)
+                if (self.chat.count + 2 > self.chat.max_messages
+                        or self.chat.file_bytes + sum(len(f["data"]) for f in files)
+                        > MAX_FILE_BYTES):
+                    return self._error(413, "history_full",
+                                       "start a new instance for a new conversation")
+            answer = self.chat.answer(body["text"])  # a slow answer holds no data lock
+            with self.chat.lock:
+                user = self.chat.add("user", body["text"], files)
+                reply = self.chat.add("assistant", answer)
+                result = {"count": self.chat.count, "messages": [user, reply]}
+            self._send(200, result)
         finally:
-            self.chat.lock.release()
+            self.chat.sending.release()
 
 
 def make_server(host="0.0.0.0", port=8080, chat=None):

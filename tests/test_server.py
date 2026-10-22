@@ -94,13 +94,16 @@ class ChatServerTest(ServerCase):
         self.assertEqual(self.chat.count, 6)
 
     def test_busy_while_a_send_is_in_progress(self):
-        self.chat.lock.acquire()
+        self.chat.sending.acquire()
         try:
             status, body = self.send(0, "one")
+            # A read still answers while a send is in progress.
+            read_status, read_body = self.call("GET", "/chat/messages")
         finally:
-            self.chat.lock.release()
+            self.chat.sending.release()
         self.assertEqual((status, body["error"]), (503, "busy"))
         self.assertEqual(self.chat.count, 0)
+        self.assertEqual((read_status, read_body["count"]), (200, 0))
 
     def test_unknown_path_and_unknown_fields(self):
         self.assertEqual(self.call("GET", "/other")[0], 404)
@@ -118,6 +121,53 @@ PNG = b"\x89PNG\r\n\x1a\n" + bytes(range(256))
 
 def b64(data):
     return base64.b64encode(data).decode()
+
+
+class ConformanceFixesTest(ServerCase):
+    """Tests 4 and 5, and the body above the limit (sections 4 and 6.2)."""
+
+    def test_4_from_with_a_digit_that_is_not_ascii_is_400_and_keeps_the_connection(self):
+        status, body = self.call("GET", "/chat/messages?from=%C2%B2")
+        self.assertEqual((status, body["error"]), (400, "bad_request"))
+        self.assertEqual(self.call("GET", "/chat/messages")[0], 200)
+
+    def test_5_from_that_is_not_valid_is_400(self):
+        for value in ("", "-1", "1.0", "a"):
+            status, body = self.call("GET", "/chat/messages?from=" + value)
+            self.assertEqual((status, body["error"]), (400, "bad_request"), value)
+
+    def test_a_body_above_the_limit_is_400_and_the_connection_stays_in_step(self):
+        from service.server import MAX_BODY
+        status, body = self.call("POST", "/chat/messages", raw="x" * (MAX_BODY + 10))
+        self.assertEqual((status, body["error"]), (400, "bad_request"))
+        self.assertEqual(self.send(0, "after")[0], 200)
+
+    def test_a_slow_send_does_not_block_a_read(self):
+        started, release = threading.Event(), threading.Event()
+        answer = self.chat.answer
+
+        def slow(text):
+            started.set()
+            release.wait(5)
+            return answer(text)
+
+        self.chat.answer = slow
+        other = http.client.HTTPConnection(*self.server.server_address)
+        result = []
+        thread = threading.Thread(target=lambda: (
+            other.request("POST", "/chat/messages",
+                          json.dumps({"expect": 0, "text": "slow"})),
+            result.append(other.getresponse().status)))
+        thread.start()
+        self.assertTrue(started.wait(5))
+        status, body = self.call("GET", "/chat/messages")
+        self.assertEqual((status, body["count"]), (200, 0))
+        self.assertEqual(self.send(0, "second")[1]["error"], "busy")
+        release.set()
+        thread.join(5)
+        other.close()
+        self.assertEqual(result, [200])
+        self.assertEqual(self.chat.count, 2)
 
 
 class AttachmentTest(ServerCase):
