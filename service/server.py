@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Echo service that follows the chat convention of chatui (docs/celaut/chat.md).
+"""Echo service that follows the chat convention of chatui (docs/celaut/chat.md, revision 5).
 
 One session for each instance. The history is in memory. The answer to a message is
-the text of the message. The service accepts image and audio files (revision 3), keeps
-them and gives them back, but it never reads their content: the answer has no
-attachment and does not depend on a file.
+the text of the message, as a whole answer (`status` `done`): the service adds the user
+message and its answer in the same step and replies at once. The service accepts image
+and audio files, keeps them and gives them back, but it never reads their content: the
+answer has no attachment and does not depend on a file.
 """
 
 import base64
@@ -20,7 +21,7 @@ MAX_TEXT = 16_384
 MAX_BODY = 24 << 20
 MAX_FILE = 4 << 20
 MAX_FILES = 4
-MAX_ANSWER = 1 << 20  # body of the answer to a read (chat.md revision 4)
+MAX_ANSWER = 1 << 20  # body of the answer to a read (chat.md section 6.2)
 MAX_FILE_BYTES = 64 << 20  # all files of the history; above it, history_full
 ACCEPTS = ["image", "audio"]
 MIME_KINDS = {"image/jpeg": "image", "image/png": "image",
@@ -35,15 +36,15 @@ class Chat:
         self.files = {}  # seq -> list of the bytes of each attachment
         self.file_bytes = 0
         self.max_messages = max_messages
+        self.cids = {}  # cid -> the user message of that send
         self.lock = threading.Lock()  # the data, held for a short time
-        self.sending = threading.Lock()  # one send in progress; never held by a read
 
     @property
     def count(self):
         return len(self.messages)
 
-    def add(self, role, text, files=()):
-        message = {"seq": self.count, "role": role, "text": text}
+    def add(self, role, text, files=(), **extra):
+        message = {"seq": self.count, "role": role, "text": text, "status": "done", **extra}
         if files:
             message["attachments"] = [f["description"] for f in files]
             self.files[message["seq"]] = [f["data"] for f in files]
@@ -56,11 +57,8 @@ class Chat:
         return text
 
 
+CID = re.compile("[A-Za-z0-9_-]{1,64}")
 ATTACHMENT = re.compile("/chat/messages/([^/]+)/attachments/([^/]+)")
-
-
-def _is_int(value):
-    return isinstance(value, int) and not isinstance(value, bool)
 
 
 def _digits(value):
@@ -152,8 +150,9 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _page(self, start):
-        """The messages from `start`, as many as fit in MAX_ANSWER, at least one.
+    def _page(self, start, limit=None):
+        """The messages from `start`, at most `limit`, as many as fit in MAX_ANSWER, at
+        least one.
 
         The caller holds the data lock. The size is that of the JSON that _send makes.
         """
@@ -162,6 +161,8 @@ class Handler(BaseHTTPRequestHandler):
         used = header
         page = []
         for message in self.chat.messages[start:]:
+            if limit is not None and len(page) >= limit:
+                break
             used += len(json.dumps(message).encode()) + 2  # ", " between messages
             if page and used > MAX_ANSWER:
                 break
@@ -175,18 +176,25 @@ class Handler(BaseHTTPRequestHandler):
             return self._attachment(*found.groups())
         if url.path != "/chat/messages":
             return self._error(404, "not_found")
-        start = 0
         query = parse_qs(url.query, keep_blank_values=True)
-        if "from" in query:
-            raw = query["from"][0]
-            if not _digits(raw):
-                return self._error(400, "bad_request", "from is not valid")
-            start = int(raw)
+        values = {}
+        for name in ("from", "last", "limit"):
+            if name in query:
+                raw = query[name][0]
+                if not _digits(raw) or (name != "from" and int(raw) == 0):
+                    return self._error(400, "bad_request", name + " is not valid")
+                values[name] = int(raw)
+        if "last" in values and ("from" in values or "limit" in values):
+            return self._error(400, "bad_request", "last cannot go with from or limit")
         with self.chat.lock:
-            if start > self.chat.count:
+            count = self.chat.count
+            start = values.get("from", 0)
+            if start > count:
                 return self._error(400, "bad_request", "from is more than count")
-            self._send(200, {"count": self.chat.count, "accepts": ACCEPTS,
-                             "messages": self._page(start)})
+            if "last" in values:
+                start = max(0, count - values["last"])
+            self._send(200, {"count": count, "accepts": ACCEPTS,
+                             "messages": self._page(start, values.get("limit"))})
 
     def do_POST(self):
         path = urlsplit(self.path).path
@@ -223,10 +231,12 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(raw)
         except ValueError:
             body = None
-        if (not isinstance(body, dict) or not _is_int(body.get("expect"))
-                or body["expect"] < 0 or not isinstance(body.get("text"), str)):
+        cid = body.get("cid") if isinstance(body, dict) else None
+        if (not isinstance(body, dict) or not isinstance(body.get("text"), str)
+                or ("cid" in body and not (isinstance(cid, str) and CID.fullmatch(cid)))):
             return self._error(400, "bad_request",
-                               "the body needs an integer expect and a text")
+                               "the body needs a text, and a cid of 1 to 64 letters, "
+                               "digits, - or _ if it has one")
         files, reason = _read_files(body)
         if reason or not (body["text"] or files):
             return self._error(400, "bad_request",
@@ -240,25 +250,22 @@ class Handler(BaseHTTPRequestHandler):
         for f in files:
             f["description"] = {"kind": MIME_KINDS[f["description"]["mime"]],
                                 **f["description"]}
-        if not self.chat.sending.acquire(blocking=False):
-            return self._error(503, "busy")
-        try:
-            with self.chat.lock:
-                if body["expect"] != self.chat.count:
-                    return self._error(409, "out_of_sync", count=self.chat.count)
-                if (self.chat.count + 2 > self.chat.max_messages
-                        or self.chat.file_bytes + sum(len(f["data"]) for f in files)
-                        > MAX_FILE_BYTES):
-                    return self._error(413, "history_full",
-                                       "start a new instance for a new conversation")
-            answer = self.chat.answer(body["text"])  # a slow answer holds no data lock
-            with self.chat.lock:
-                user = self.chat.add("user", body["text"], files)
-                reply = self.chat.add("assistant", answer)
-                result = {"count": self.chat.count, "messages": [user, reply]}
-            self._send(200, result)
-        finally:
-            self.chat.sending.release()
+        with self.chat.lock:
+            known = self.chat.cids.get(cid) if cid else None
+            if known:  # the same send again: the same message, nothing added
+                return self._send(200, {"count": self.chat.count, "message": known})
+            if (self.chat.count + 2 > self.chat.max_messages
+                    or self.chat.file_bytes + sum(len(f["data"]) for f in files)
+                    > MAX_FILE_BYTES):
+                return self._error(413, "history_full",
+                                   "start a new instance for a new conversation")
+            # The echo is ready at once: the two messages go in together.
+            extra = {"cid": cid} if cid else {}
+            user = self.chat.add("user", body["text"], files, **extra)
+            self.chat.add("assistant", self.chat.answer(body["text"]), reply_to=user["seq"])
+            if cid:
+                self.chat.cids[cid] = user
+            self._send(200, {"count": self.chat.count, "message": user})
 
 
 def make_server(host="0.0.0.0", port=8080, chat=None):

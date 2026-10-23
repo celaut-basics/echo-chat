@@ -4,7 +4,9 @@ An echo service that follows the chat convention of chatui
 ([docs/celaut/chat.md](https://github.com/celaut-project/chatui/blob/master/docs/celaut/chat.md)).
 It is the check of milestone M4: the answer to each message is the text of the message.
 
-It follows revision 4 of `chat.md` (2026-10-22, ASD-STE100), with attachments.
+It follows revision 5 of `chat.md` (2026-10-23, ASD-STE100), with attachments. A send replies at
+once with the user message and the client reads the answer with `GET`. The echo is ready at
+once, so each answer is a whole message with `status` `done`. The service does not stream.
 The service ignores the content of files: it accepts, validates, keeps and gives
 back each file, but it never reads or interprets a file. The answer is the echo
 of `text` only and has no attachment.
@@ -15,13 +17,19 @@ One HTTP slot on `:8080` (the `PORT` variable changes it).
 
 | Request | Meaning |
 |---|---|
-| `POST /chat/messages` with `{"expect": N, "text": "...", "attachments": [...]}` | Add a user message and its echo. `expect` is the `count` that the client believes the service has. `attachments` is optional |
+| `POST /chat/messages` with `{"cid": "...", "text": "...", "attachments": [...]}` | Add a user message and its echo, and reply with `{"count", "message"}` (the user message). `cid` (1 to 64 characters of `A-Za-z0-9_-`) and `attachments` are optional. A second send with the same `cid` gives the same message and adds nothing. Many sends can come at the same time |
 | `GET /chat/messages?from=N` | The messages with `seq` of N or more, `count` and `accepts` (`["image", "audio"]`). The body is 1 MiB or less: if the messages from N are more, the answer has fewer messages, in order from N, at least one. `count` is always the total |
+| `GET /chat/messages?last=N` | The last N messages |
+| `GET /chat/messages?from=N&limit=M` | At most M messages from N. `last` cannot go with `from` or `limit` (400) |
 | `GET /chat/messages/{seq}/attachments/{index}` | The bytes of a file of a user message, with its `Content-Type` |
 
+A message has `seq`, `role`, `text`, `status` (always `done` here), `attachments` (user
+messages with files), `cid` (user messages sent with one) and `reply_to` (the answer: the `seq`
+of the message that it answers).
+
 Status codes: 200, 400 `bad_request`, 404 `not_found`, 405 `method_not_allowed`,
-409 `out_of_sync` (with `count`), 413 `history_full` (10 000 messages, or 64 MiB of
-files), 415 `unsupported_media`, 503 `busy`.
+413 `history_full` (10 000 messages, or 64 MiB of files), 415 `unsupported_media`. The
+service never gives 409 or 503: it needs no `expect`, and it never makes a message wait.
 
 ## Files
 
@@ -93,14 +101,22 @@ The service needs no network. Resources: 128 MiB of memory at start
 nodo import <6hex>.celaut.bee     # or: nodo pack amd64
 nodo execute <service id>         # prints the local address of the slot
 curl -s -X POST -H 'Content-Type: application/json' \
-     -d '{"expect": 0, "text": "Hello"}' http://<address>/chat/messages
+     -d '{"cid": "first", "text": "Hello"}' http://<address>/chat/messages
+curl -s http://<address>/chat/messages
 ```
 
-The answer:
+The reply to the send:
 
 ```json
-{"count": 2, "messages": [{"seq": 0, "role": "user", "text": "Hello"},
-                          {"seq": 1, "role": "assistant", "text": "Hello"}]}
+{"count": 2, "message": {"seq": 0, "role": "user", "text": "Hello", "status": "done", "cid": "first"}}
+```
+
+The read:
+
+```json
+{"count": 2, "accepts": ["image", "audio"],
+ "messages": [{"seq": 0, "role": "user", "text": "Hello", "status": "done", "cid": "first"},
+              {"seq": 1, "role": "assistant", "text": "Hello", "status": "done", "reply_to": 0}]}
 ```
 
 Stop the instance with `nodo kill <instance>`. The conversation ends with it.
@@ -117,6 +133,6 @@ clean registry. Import it with `nodo import <file>`.
 
     python3 -m unittest discover -s tests -t .
 
-`tests/test_server.py` tests the server, with the conformance tests 15 and 19 to 26 of
-`chat.md` for the files and a test of the 1 MiB limit of a read. `tests/test_layout.py` and
+`tests/test_server.py` tests the server, with the conformance tests of `chat.md` (sends
+at the same time, `cid`, the filters `from`, `last` and `limit`, the files) and a test of the 1 MiB limit of a read. `tests/test_layout.py` and
 `tests/test_manifest.py` check the pack roots without a node.

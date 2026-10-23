@@ -61,7 +61,9 @@ from service.server import make_server; \
 s = make_server('127.0.0.1', 0); \
 threading.Thread(target=s.serve_forever, daemon=True).start(); \
 c = http.client.HTTPConnection(*s.server_address); \
-c.request('POST', '/chat/messages', json.dumps({'expect': 0, 'text': 'ping'})); \
+c.request('POST', '/chat/messages', json.dumps({'cid': 'smoke', 'text': 'ping'})); \
+assert json.loads(c.getresponse().read())['message']['text'] == 'ping'; \
+c.request('GET', '/chat/messages'); \
 r = json.loads(c.getresponse().read()); \
-assert r['messages'][1] == {'seq': 1, 'role': 'assistant', 'text': 'ping'}, r; \
+assert r['messages'][1] == {'seq': 1, 'role': 'assistant', 'text': 'ping', 'status': 'done', 'reply_to': 0}, r; \
 print('smoke test: echo ok')"
