@@ -9,10 +9,11 @@
             "port": 8080,
             "transport": "tcp",
             "protocol_stack": [
-                ["http"],
+                ["http2"],
+                ["grpc"],
                 {
                     "tags": ["chat"],
-                    "prose": "Echo service of the chat convention of chatui (docs/celaut/chat.md). The answer to each message is the text of the message. One instance is one conversation."
+                    "prose": "Echo service of the chat interface of chatui (docs/celaut/chat.md, revision 6, gRPC over h2c). The answer to each message is the text of the message. One instance is one conversation."
                 }
             ]
         }
