@@ -1,0 +1,551 @@
+syntax = "proto3";
+
+// Interfaz "chat" de Celaut. La especificación normativa está en
+// docs/celaut/chat.md (revisión 6). Los campos y mensajes marcados con
+// "Revisión 6" se añadieron después de la primera versión de este archivo:
+// tienen números posteriores a los existentes, que no cambian.
+
+// No hay package: las rutas de las llamadas son /ChatService/<Método> y
+// /FileService/<Método>.
+
+// ============================================================
+// Chat service
+// ============================================================
+
+service ChatService {
+  // Envía un mensaje a la conversación principal o a una rama.
+  rpc SendMessage(SendMessageRequest) returns (Message);
+
+  // Recupera mensajes de forma incremental.
+  // after_sequence = 0 permite comenzar desde el inicio.
+  rpc GetMessages(GetMessagesRequest) returns (stream Message);
+
+  // Canal bidireccional para mensajes y eventos en tiempo real.
+  rpc Connect(stream ClientEvent) returns (stream ServerEvent);
+
+  // Crea una rama desde un mensaje existente.
+  rpc ForkConversation(ForkConversationRequest)
+      returns (Conversation);
+
+  // Consulta los metadatos de una conversación.
+  rpc GetConversation(GetConversationRequest)
+      returns (Conversation);
+
+  // Fija o desfija un mensaje.
+  rpc SetMessagePinned(SetMessagePinnedRequest)
+      returns (Message);
+
+  // Revisión 6.
+  // Consulta lo que el servicio acepta y sus límites.
+  // Es la primera llamada del cliente: también sirve para saber
+  // si el servicio ya escucha. Su resultado no cambia durante la
+  // vida de la instancia.
+  rpc GetCapabilities(GetCapabilitiesRequest)
+      returns (Capabilities);
+}
+
+// ============================================================
+// File service
+// ============================================================
+
+service FileService {
+  // Consulta la disponibilidad de archivos identificados por hash.
+  //
+  // Se envía un hash por mensaje y se recibe una respuesta
+  // por cada consulta, en el mismo orden.
+  //
+  // El primer hash debe incluir type.
+  // Los siguientes pueden omitirlo para reutilizar el último
+  // type explícito del mismo stream cliente-servidor.
+  rpc QueryFiles(stream QueryFilesRequest)
+      returns (stream QueryFilesResponse);
+
+  // Sube un archivo mediante streaming.
+  //
+  // El primer mensaje contiene los metadatos del archivo.
+  // Los mensajes siguientes contienen bloques de bytes.
+  rpc UploadFile(stream UploadFileRequest)
+      returns (UploadFileResponse);
+
+  // Descarga un archivo identificado por su hash.
+  rpc DownloadFile(DownloadFileRequest)
+      returns (stream DownloadFileResponse);
+}
+
+// ============================================================
+// Conversations
+// ============================================================
+
+message Conversation {
+  // Identificador de la conversación.
+  // La conversación principal no necesita identificador explícito.
+  string conversation_id = 1;
+
+  // Conversación de origen. Ausente para la conversación principal.
+  optional string parent_conversation_id = 2;
+
+  // Mensaje desde el que se creó esta rama.
+  optional string forked_from_message_id = 3;
+
+  // Nombre opcional para identificar el hilo.
+  optional string title = 4;
+
+  // Fecha de creación, en milisegundos Unix.
+  int64 created_at = 5;
+
+  // Indica si la conversación está archivada.
+  bool archived = 6;
+}
+
+message ForkConversationRequest {
+  // Conversación de origen.
+  // Ausente para la conversación principal.
+  optional string parent_conversation_id = 1;
+
+  // Mensaje de origen de la bifurcación.
+  string forked_from_message_id = 2;
+
+  // Título opcional de la nueva rama.
+  optional string title = 3;
+}
+
+message GetConversationRequest {
+  // Ausente para la conversación principal.
+  optional string conversation_id = 1;
+}
+
+// ============================================================
+// Messages
+// ============================================================
+
+message Message {
+  // Identificador estable del mensaje.
+  string message_id = 1;
+
+  // Secuencia incremental dentro de su conversación.
+  uint64 sequence = 2;
+
+  // Ausente para la conversación principal.
+  optional string conversation_id = 3;
+
+  // Contenido del mensaje.
+  //
+  // Revisión 6: el contenido es el que el mensaje tiene cuando su
+  // estado es COMPLETED, FAILED o CANCELLED (estado final). Entonces
+  // no cambia nunca. Mientras el estado es PENDING o IN_PROGRESS,
+  // contiene lo producido hasta ese momento y solo puede crecer al
+  // final con MessageDelta (ver MessageDelta).
+  repeated ContentPart content = 4;
+
+  // Estado de procesamiento.
+  MessageStatus status = 5;
+
+  // Fecha de creación, en milisegundos Unix.
+  int64 created_at = 6;
+
+  // Fecha de la última modificación del estado o de la fijación.
+  int64 updated_at = 7;
+
+  // Mensaje al que responde, si corresponde.
+  optional string reply_to_message_id = 8;
+
+  // Indica si está fijado.
+  bool pinned = 9;
+
+  // Metadatos extensibles en formato clave-valor.
+  map<string, string> metadata = 10;
+
+  // false = usuario; true = servicio.
+  bool from_service = 11;
+
+  // Revisión 6.
+  // Razonamiento del modelo, aparte del contenido. Solo lo tiene un
+  // mensaje del servicio. Sigue la misma regla que content: solo
+  // crece al final con MessageDelta mientras el estado no es final.
+  // Vacío si el servicio no da razonamiento.
+  string reasoning = 12;
+
+  // Revisión 6.
+  // idempotency_key de SendMessageRequest que creó este mensaje.
+  // Solo lo tiene un mensaje del usuario, y solo si el envío lo tenía.
+  optional string idempotency_key = 13;
+}
+
+message SendMessageRequest {
+  // Ausente para enviar a la conversación principal.
+  optional string conversation_id = 1;
+
+  // Contenido del mensaje.
+  repeated ContentPart content = 2;
+
+  // Referencia opcional al mensaje al que se responde.
+  optional string reply_to_message_id = 3;
+
+  // Evita duplicados cuando se reintenta una operación.
+  //
+  // Revisión 6: de 1 a 64 caracteres de A-Z, a-z, 0-9, "-" y "_".
+  // Es único dentro de una conversación. Si ya existe un mensaje del
+  // usuario con la misma clave, el servicio devuelve ese mensaje y no
+  // crea otro.
+  optional string idempotency_key = 4;
+}
+
+message GetMessagesRequest {
+  // Ausente para consultar la conversación principal.
+  optional string conversation_id = 1;
+
+  // Recupera mensajes cuya secuencia sea mayor que este valor.
+  uint64 after_sequence = 2;
+
+  // Número máximo de mensajes que se deben devolver.
+  // 0 significa que se aplica el límite predeterminado del servidor.
+  // Devuelve los primeros mensajes del rango.
+  uint32 limit = 3;
+
+  // Recupera mensajes cuya secuencia sea menor que este valor.
+  // 0 significa que no hay cota superior.
+  uint64 before_sequence = 4;
+
+  // Devuelve solo los últimos N mensajes del rango, en orden de secuencia.
+  // 0 significa que no se aplica. No se puede combinar con limit.
+  uint32 last = 5;
+}
+
+message SetMessagePinnedRequest {
+  string message_id = 1;
+
+  // Ausente para la conversación principal.
+  optional string conversation_id = 2;
+
+  bool pinned = 3;
+}
+
+enum MessageStatus {
+  MESSAGE_STATUS_UNSPECIFIED = 0;
+  MESSAGE_STATUS_PENDING = 1;
+  MESSAGE_STATUS_IN_PROGRESS = 2;
+  MESSAGE_STATUS_COMPLETED = 3;
+  MESSAGE_STATUS_FAILED = 4;
+  MESSAGE_STATUS_CANCELLED = 5;
+}
+
+// ============================================================
+// Message lifecycle events
+// ============================================================
+
+message MessageCreated {
+  Message message = 1;
+}
+
+message MessageDeleted {
+  string message_id = 1;
+
+  // Ausente para la conversación principal.
+  optional string conversation_id = 2;
+}
+
+message MessageStatusChanged {
+  string message_id = 1;
+
+  // Ausente para la conversación principal.
+  optional string conversation_id = 2;
+
+  MessageStatus status = 3;
+
+  // Fecha del cambio de estado, en milisegundos Unix.
+  int64 updated_at = 4;
+}
+
+// Revisión 6.
+// Añade texto al final de un mensaje que no está en estado final.
+// El texto se añade a la última parte TextContent de content. Si
+// content no tiene partes, o su última parte no es TextContent, el
+// receptor añade una parte TextContent nueva al final.
+// Solo se puede enviar para un mensaje en estado IN_PROGRESS, después
+// de su MessageCreated. No cambia updated_at.
+message MessageDelta {
+  string message_id = 1;
+
+  // Ausente para la conversación principal.
+  optional string conversation_id = 2;
+
+  // Texto que se añade al final del contenido. Puede estar vacío.
+  string text_append = 3;
+
+  // Texto que se añade al final de Message.reasoning. Puede estar vacío.
+  string reasoning_append = 4;
+}
+
+// Revisión 6.
+// Cambio del campo pinned de un mensaje, hecho por el servicio o por
+// SetMessagePinned de otro cliente.
+message MessagePinnedChanged {
+  string message_id = 1;
+
+  // Ausente para la conversación principal.
+  optional string conversation_id = 2;
+
+  bool pinned = 3;
+
+  // Fecha del cambio, en milisegundos Unix.
+  int64 updated_at = 4;
+}
+
+message MessageProgress {
+  string message_id = 1;
+
+  // Progreso entre 0 y 1, si se conoce.
+  optional float progress = 2;
+
+  // Descripción del estado actual.
+  optional string description = 3;
+}
+
+message SubscriptionReady {
+  // Última secuencia disponible al confirmar la suscripción.
+  uint64 latest_sequence = 1;
+}
+
+message ProtocolError {
+  string code = 1;
+  string message = 2;
+
+  // Revisión 6.
+  // event_id del ClientEvent que falló. Ausente si el error no
+  // corresponde a un evento del cliente, o si el evento no tenía
+  // event_id.
+  optional string event_id = 3;
+}
+
+// ============================================================
+// Multimodal content
+// ============================================================
+
+message ContentPart {
+  oneof kind {
+    TextContent text = 1;
+    FileReference file = 2;
+    ImageContent image = 3;
+    AudioContent audio = 4;
+    StructuredContent structured = 5;
+  }
+}
+
+message TextContent {
+  string text = 1;
+}
+
+// ============================================================
+// Content hashes
+// ============================================================
+
+message Hash {
+  // Identifica el algoritmo de hash y su longitud de salida.
+  //
+  // Se define como el digest de una entrada vacía calculado
+  // con ese algoritmo y esa longitud.
+  //
+  // Puede omitirse en QueryFilesRequest para reutilizar el último
+  // type explícito del mismo stream cliente-servidor.
+  optional bytes type = 1;
+
+  // Digest del contenido.
+  bytes value = 2;
+}
+
+// ============================================================
+// File references
+// ============================================================
+
+message FileReference {
+  // Hashes que identifican el mismo contenido.
+  // Cada hash debe incluir type explícitamente.
+  repeated Hash hashes = 1;
+
+  // Nombre del archivo, si se conoce.
+  optional string filename = 2;
+
+  // Tipo MIME, si se conoce.
+  optional string mime_type = 3;
+
+  // Tamaño del archivo en bytes, si se conoce.
+  optional uint64 size_bytes = 4;
+}
+
+message ImageContent {
+  // Referencia al contenido de imagen almacenado.
+  FileReference file = 1;
+
+  // Descripción alternativa de la imagen.
+  optional string alt_text = 2;
+}
+
+message AudioContent {
+  // Referencia al contenido de audio almacenado.
+  FileReference file = 1;
+
+  // Transcripción del audio, si existe.
+  optional string transcript = 2;
+
+  // Duración del audio en milisegundos.
+  optional uint64 duration_ms = 3;
+}
+
+message StructuredContent {
+  // Tipo MIME del contenido.
+  // Por ejemplo: application/json.
+  string media_type = 1;
+
+  // Datos serializados.
+  bytes data = 2;
+}
+
+// ============================================================
+// File queries
+// ============================================================
+
+message QueryFilesRequest {
+  // Hash del archivo que se desea consultar.
+  //
+  // Si type está omitido, se utiliza el último type explícito
+  // recibido en un Hash anterior del mismo stream.
+  //
+  // El primer hash del stream debe incluir type.
+  Hash hash = 1;
+}
+
+message QueryFilesResponse {
+  // Hash consultado, con type explícito.
+  Hash hash = 1;
+
+  // Indica si el contenido está disponible para el solicitante.
+  bool available = 2;
+}
+
+// ============================================================
+// File upload
+// ============================================================
+
+message UploadFileRequest {
+  oneof part {
+    // Debe aparecer una vez, al principio del stream.
+    FileReference file = 1;
+
+    // Bloque de datos del archivo.
+    // Solo puede aparecer después de FileReference.
+    bytes chunk = 2;
+  }
+}
+
+message UploadFileResponse {
+  // Referencia confirmada por el servidor, con los hashes
+  // validados y el tamaño real del archivo.
+  FileReference file = 1;
+}
+
+// ============================================================
+// File download
+// ============================================================
+
+message DownloadFileRequest {
+  // Hash que identifica el archivo.
+  // type debe estar presente explícitamente.
+  Hash hash = 1;
+}
+
+message DownloadFileResponse {
+  // Bloque consecutivo del archivo.
+  // El final del stream indica el final de la transferencia.
+  bytes chunk = 1;
+}
+
+// ============================================================
+// Capabilities (revisión 6)
+// ============================================================
+
+message GetCapabilitiesRequest {}
+
+message Capabilities {
+  // Tipos MIME que el servicio acepta en SendMessage, en minúsculas y
+  // sin parámetros. Vacío: el servicio acepta solo texto.
+  repeated string accepted_mime_types = 1;
+
+  // Tamaño máximo de un archivo, en bytes. 0: el valor de chat.md.
+  uint64 max_file_bytes = 2;
+
+  // Número máximo de archivos en un mensaje. 0: el valor de chat.md.
+  uint32 max_files_per_message = 3;
+
+  // Tamaño máximo del texto de un mensaje, en bytes UTF-8.
+  // 0: el valor de chat.md.
+  uint32 max_text_bytes = 4;
+
+  // El servicio implementa ForkConversation y las conversaciones
+  // distintas de la principal.
+  bool supports_fork = 5;
+
+  // El servicio implementa CancelMessageRequest.
+  bool supports_cancel = 6;
+}
+
+// ============================================================
+// Real-time communication
+// ============================================================
+
+message ClientEvent {
+  oneof event {
+    SendMessageRequest send_message = 1;
+    SubscribeRequest subscribe = 2;
+    AcknowledgeEvent acknowledge = 3;
+    CancelMessageRequest cancel_message = 4;
+  }
+
+  // Revisión 6.
+  // Identificador del evento, de 1 a 64 caracteres de A-Z, a-z, 0-9,
+  // "-" y "_". Es único dentro del stream. Es opcional, pero un
+  // cliente que envía eventos por Connect debe ponerlo. Si el evento
+  // falla, el servicio lo copia en ProtocolError.event_id.
+  optional string event_id = 5;
+}
+
+message ServerEvent {
+  oneof event {
+    MessageCreated message_created = 1;
+    MessageDeleted message_deleted = 2;
+    MessageProgress message_progress = 3;
+    SubscriptionReady subscription_ready = 4;
+    ProtocolError error = 5;
+    MessageStatusChanged message_status_changed = 6;
+    // Revisión 6.
+    MessageDelta message_delta = 7;
+    // Revisión 6.
+    MessagePinnedChanged message_pinned_changed = 8;
+  }
+}
+
+message SubscribeRequest {
+  // Ausente para la conversación principal.
+  optional string conversation_id = 1;
+
+  // Última secuencia procesada por el cliente.
+  uint64 after_sequence = 2;
+}
+
+message AcknowledgeEvent {
+  // Última secuencia procesada por el cliente.
+  //
+  // Revisión 6: es una indicación de que el cliente tiene todos los
+  // mensajes hasta esa secuencia en estado final. El servicio puede
+  // descartar los eventos pendientes de esos mensajes. Nunca borra el
+  // historial. Una secuencia mayor que la última del servicio produce
+  // ProtocolError bad_request. Una secuencia menor que una anterior
+  // se ignora. No tiene respuesta positiva.
+  uint64 last_sequence = 1;
+}
+
+message CancelMessageRequest {
+  string message_id = 1;
+
+  // Ausente para la conversación principal.
+  optional string conversation_id = 2;
+}

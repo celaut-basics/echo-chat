@@ -1,0 +1,5 @@
+# The versions of the image (Debian bookworm). The service itself needs only the
+# first two; grpcio-tools makes the stubs (scripts/gen_proto.sh).
+grpcio==1.51.1
+protobuf==4.21.12
+grpcio-tools==1.51.1
