@@ -1,377 +1,205 @@
-import base64
-import http.client
-import json
-import threading
+"""Tests of the gRPC server of the echo service (chat.md revision 6).
+
+`ConformanceTest` runs the conformance runner (conformance/runner.py, the tests of
+section 11.1) against a server in this process. The other tests check what is particular
+to the echo: the answer, the commands at the start of a text and the options of `Chat`.
+
+Needs grpcio and protobuf (requirements-dev.txt).
+"""
+import hashlib
+import io
+import time
 import unittest
 
-from service.server import Chat, make_server
+import grpc
+
+from conformance.runner import PROFILES, Conformance
+from service import chat_pb2 as pb
+from service import chat_pb2_grpc as rpc
+from service.server import make_server
+from service.store import Chat, parse_commands
 
 
 class ServerCase(unittest.TestCase):
+    chat_options = {}
+
     def setUp(self):
-        self.chat = Chat(max_messages=6)
-        self.server = make_server("127.0.0.1", 0, self.chat)
-        threading.Thread(target=self.server.serve_forever, daemon=True).start()
-        self.conn = http.client.HTTPConnection(*self.server.server_address)
+        self.server, port, self.chat = make_server("127.0.0.1", 0, Chat(**self.chat_options))
+        self.server.start()
+        self.channel = grpc.insecure_channel("127.0.0.1:%d" % port)
+        self.stub = rpc.ChatServiceStub(self.channel)
 
     def tearDown(self):
-        self.conn.close()
-        self.server.shutdown()
-        self.server.server_close()
+        self.channel.close()
+        self.server.stop(0)
+        self.chat.close()
 
-    def call(self, method, path, body=None, raw=None):
-        data = raw if raw is not None else (None if body is None else json.dumps(body))
-        self.conn.request(method, path, data, {"Content-Type": "application/json"})
-        response = self.conn.getresponse()
-        return response.status, json.loads(response.read())
+    def send(self, text, **fields):
+        return self.stub.SendMessage(pb.SendMessageRequest(
+            content=[pb.ContentPart(text=pb.TextContent(text=text))], **fields))
 
-    def send(self, text, **extra):
-        return self.call("POST", "/chat/messages", {"text": text, **extra})
+    def history(self, wait=0.0):
+        time.sleep(wait)
+        return list(self.stub.GetMessages(pb.GetMessagesRequest()))
+
+    def wait_final(self, count):
+        end = time.time() + 10
+        while time.time() < end:
+            messages = self.history()
+            if len(messages) >= count and all(
+                    m.status == pb.MESSAGE_STATUS_COMPLETED or m.status == pb.MESSAGE_STATUS_FAILED
+                    for m in messages):
+                return messages
+            time.sleep(0.05)
+        self.fail("the answers are not final")
 
 
-def user(seq, text, **extra):
-    return {"seq": seq, "role": "user", "text": text, "status": "done", **extra}
+def body(message):
+    return "".join(p.text.text for p in message.content)
 
 
-def answer(seq, text, reply_to):
-    return {"seq": seq, "role": "assistant", "text": text, "status": "done",
-            "reply_to": reply_to}
+class ConformanceTest(unittest.TestCase):
+    def test_the_conformance_tests_of_section_11_1(self):
+        server, port, chat = make_server("127.0.0.1", 0, Chat(max_messages=600, max_queue=4))
+        server.start()
+        try:
+            out = io.StringIO()
+            run = Conformance("127.0.0.1:%d" % port, profile=PROFILES["echo"],
+                              history_limit=600, queue_limit=4)
+            passed = run.run(out=out)
+            self.assertTrue(passed, out.getvalue())
+            # The tests that do not apply to this service are skipped, and only those.
+            skipped = {line.split()[2] for line in out.getvalue().splitlines() if line.startswith("skip")}
+            self.assertEqual(skipped, {"42", "43", "44", "66", "67", "73"})
+        finally:
+            server.stop(0)
+            chat.close()
 
 
-class ChatServerTest(ServerCase):
-    def test_send_returns_the_user_message_and_the_answer_is_in_the_history(self):
-        status, body = self.send("Hello", cid="k1")
-        self.assertEqual(status, 200)
-        self.assertEqual(body, {"count": 2, "message": user(0, "Hello", cid="k1")})
-        _, history = self.call("GET", "/chat/messages")
-        self.assertEqual(history["messages"], [user(0, "Hello", cid="k1"),
-                                               answer(1, "Hello", 0)])
+class EchoTest(ServerCase):
+    def test_the_answer_is_the_text_of_the_message_as_a_whole_answer(self):
+        user = self.send("Hello", idempotency_key="k1")
+        self.assertEqual((user.sequence, user.from_service, user.idempotency_key), (1, False, "k1"))
+        user_message, answer = self.wait_final(2)
+        self.assertEqual(user_message, user)
+        self.assertEqual((answer.sequence, body(answer), answer.reply_to_message_id, answer.from_service),
+                         (2, "Hello", user.message_id, True))
+        self.assertEqual(answer.created_at, answer.updated_at)
+        self.assertEqual(answer.reasoning, "")
 
-    def test_messages_are_numbered_in_order_on_one_connection(self):
-        self.send("one")
-        _, body = self.send("two")
-        self.assertEqual(body["message"]["seq"], 2)
-        self.assertEqual(body["count"], 4)
-        _, history = self.call("GET", "/chat/messages")
-        self.assertEqual([m["seq"] for m in history["messages"]], [0, 1, 2, 3])
-        self.assertEqual([m["reply_to"] for m in history["messages"][1::2]], [0, 2])
+    def test_the_same_key_gives_the_same_message_and_adds_nothing(self):
+        first = self.send("one", idempotency_key="same")
+        self.assertEqual(self.send("one", idempotency_key="same"), first)
+        self.assertEqual(len(self.wait_final(2)), 2)
 
-    def test_the_same_cid_gives_the_same_message_and_adds_nothing(self):
-        _, first = self.send("one", cid="same")
-        status, again = self.send("one", cid="same")
-        self.assertEqual(status, 200)
-        self.assertEqual(again["message"], first["message"])
-        self.assertEqual(self.chat.count, 2)
-
-    def test_sends_at_the_same_time_are_all_taken(self):
-        results = []
-        self.chat.max_messages = 100
-
-        def post(i):
-            conn = http.client.HTTPConnection(*self.server.server_address)
-            conn.request("POST", "/chat/messages", json.dumps({"cid": "c%d" % i, "text": "m"}))
-            results.append(conn.getresponse().status)
-            conn.close()
-
-        threads = [threading.Thread(target=post, args=(i,)) for i in range(8)]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join(5)
-        self.assertEqual(results, [200] * 8)
-        _, history = self.call("GET", "/chat/messages")
-        self.assertEqual(history["count"], 16)
-        self.assertEqual([m["seq"] for m in history["messages"]], list(range(16)))
-        for m in history["messages"][1::2]:  # each answer follows the message it answers
-            self.assertEqual(m["reply_to"], m["seq"] - 1)
-
-    def test_history_from(self):
-        self.send("one")
-        self.send("two")
-        _, body = self.call("GET", "/chat/messages?from=3")
-        self.assertEqual(body["count"], 4)
-        self.assertEqual([m["seq"] for m in body["messages"]], [3])
-        _, body = self.call("GET", "/chat/messages?from=4")
-        self.assertEqual(body["messages"], [])
-
-    def test_history_last_and_limit(self):
-        self.chat.max_messages = 100
-        for text in ("a", "b", "c"):
+    def test_a_text_that_starts_with_a_word_that_is_not_a_command_is_echoed_whole(self):
+        for text in ("/etc/passwd", "/stream=x a", "/pin=now", "/reject=no", " /stream a"):
             self.send(text)
-        _, body = self.call("GET", "/chat/messages?last=2")
-        self.assertEqual((body["count"], [m["seq"] for m in body["messages"]]), (6, [4, 5]))
-        _, body = self.call("GET", "/chat/messages?last=1000")
-        self.assertEqual(len(body["messages"]), 6)
-        _, body = self.call("GET", "/chat/messages?from=2&limit=1")
-        self.assertEqual([m["seq"] for m in body["messages"]], [2])
-        _, body = self.call("GET", "/chat/messages?limit=3")
-        self.assertEqual([m["seq"] for m in body["messages"]], [0, 1, 2])
+        self.assertEqual([body(m) for m in self.wait_final(10)[1::2]],
+                         ["/etc/passwd", "/stream=x a", "/pin=now", "/reject=no", " /stream a"])
 
-    def test_filters_that_are_not_valid_are_400(self):
-        self.send("one")
-        for query in ("from=1&last=1", "last=1&limit=1", "last=0", "limit=0", "last=a",
-                      "limit=", "from=3", "last=-1"):
-            status, body = self.call("GET", "/chat/messages?" + query)
-            self.assertEqual((status, body["error"]), (400, "bad_request"), query)
+    def test_echo_ends_the_commands(self):
+        self.send("/echo /stream a b")
+        self.assertEqual(body(self.wait_final(2)[1]), "/stream a b")
 
-    def test_history_without_filters_has_all(self):
-        self.send("one")
-        _, body = self.call("GET", "/chat/messages")
-        self.assertEqual(len(body["messages"]), 2)
+    def test_a_user_message_keeps_the_commands_in_its_text(self):
+        user = self.send("/pin hello")
+        self.assertEqual(body(user), "/pin hello")
+        self.assertEqual(body(self.wait_final(2)[1]), "hello")
 
-    def test_history_from_more_than_count_is_bad_request(self):
-        status, body = self.call("GET", "/chat/messages?from=1")
-        self.assertEqual((status, body["error"]), (400, "bad_request"))
-        status, _ = self.call("GET", "/chat/messages?from=x")
-        self.assertEqual(status, 400)
-
-    def test_bad_bodies(self):
-        for body in [{"expect": 0}, {"text": ""}, {"text": 5}, {"text": "a", "cid": 5},
-                     {"text": "a", "cid": "a b"}, {"text": "a", "cid": ""},
-                     {"text": "a", "cid": "x" * 65}, [1]]:
-            status, reply = self.call("POST", "/chat/messages", body)
-            self.assertEqual((status, reply["error"]), (400, "bad_request"), body)
-        status, _ = self.call("POST", "/chat/messages", raw="not json")
-        self.assertEqual(status, 400)
-        self.assertEqual(self.chat.count, 0)
-
-    def test_a_cid_of_64_characters_is_valid(self):
-        self.assertEqual(self.send("a", cid="x" * 64)[0], 200)
-
-    def test_history_full(self):
-        for _ in range(3):
-            self.assertEqual(self.send("x")[0], 200)
-        status, body = self.send("x")
-        self.assertEqual((status, body["error"]), (413, "history_full"))
-        self.assertEqual(self.chat.count, 6)
-
-    def test_history_full_does_not_stop_the_same_cid_from_giving_its_message(self):
-        _, first = self.send("x", cid="a")
-        for _ in range(2):
-            self.send("x")
-        self.assertEqual(self.send("x")[0], 413)
-        status, again = self.send("x", cid="a")
-        self.assertEqual((status, again["message"]), (200, first["message"]))
-
-    def test_the_old_expect_field_is_ignored(self):
-        status, body = self.call("POST", "/chat/messages", {"expect": 99, "text": "a"})
-        self.assertEqual((status, body["message"]["seq"]), (200, 0))
-
-    def test_unknown_path_and_unknown_fields(self):
-        self.assertEqual(self.call("GET", "/other")[0], 404)
-        status, _ = self.call("POST", "/chat/messages", {"text": "a", "future": 1})
-        self.assertEqual(status, 200)
-
-    def test_text_is_not_changed(self):
-        _, body = self.send("  x  é ✓")
-        self.assertEqual(body["message"]["text"], "  x  é ✓")
-
-    def test_utf8(self):
-        self.send("¿Qué tal? 你好")
-        _, history = self.call("GET", "/chat/messages")
-        self.assertEqual(history["messages"][1]["text"], "¿Qué tal? 你好")
+    def test_history_full_counts_the_answers_that_wait(self):
+        self.chat.max_messages = 4
+        self.send("/delay=300 one")
+        self.send("two")
+        with self.assertRaises(grpc.RpcError) as error:
+            self.send("three")
+        self.assertEqual(error.exception.code(), grpc.StatusCode.RESOURCE_EXHAUSTED)
+        self.assertEqual(len(self.wait_final(4)), 4)
 
 
-PNG = b"\x89PNG\r\n\x1a\n" + bytes(range(256))
+class EchoStreamTest(ServerCase):
+    chat_options = {"stream": "reasoning", "delay_ms": 1}
+
+    def test_the_environment_makes_every_answer_stream_with_reasoning(self):
+        self.send("one two  three")
+        answer = self.wait_final(2)[1]
+        self.assertEqual(body(answer), "one two  three")
+        self.assertTrue(answer.reasoning)
+        self.assertEqual(len(answer.content), 1)
+
+    def test_pending_then_in_progress_then_final_with_one_event_each(self):
+        events = self.subscribe_events()
+        self.send("/pending /stream=100 a b")
+        created = self.take(events, lambda e: e.WhichOneof("event") == "message_created", 2)
+        self.assertEqual(created[1].message_created.message.status, pb.MESSAGE_STATUS_PENDING)
+        changes = self.take(events, lambda e: e.WhichOneof("event") == "message_status_changed", 2)
+        self.assertEqual([e.message_status_changed.status for e in changes],
+                         [pb.MESSAGE_STATUS_IN_PROGRESS, pb.MESSAGE_STATUS_COMPLETED])
+
+    def test_a_late_pin_is_an_event_after_the_answer_is_final(self):
+        events = self.subscribe_events()
+        self.send("/pin=late x")
+        kinds = []
+        for event in events:
+            kinds.append(event.WhichOneof("event"))
+            if kinds[-1] == "message_pinned_changed":
+                break
+        self.assertEqual(kinds[-3:], ["message_delta", "message_status_changed", "message_pinned_changed"])
+        self.assertTrue(self.wait_final(2)[1].pinned)
+
+    def test_a_failed_answer_keeps_what_it_made_and_tells_why(self):
+        self.send("/fail one two three four")
+        answer = self.wait_final(2)[1]
+        self.assertEqual(answer.status, pb.MESSAGE_STATUS_FAILED)
+        self.assertEqual(body(answer), "one two ")
+        self.assertIn("/fail", answer.metadata["error"])
+
+    def test_attachments_are_echoed_when_asked(self):
+        data = b"\x89PNG\r\n\x1a\n" + b"x" * 10
+        ref = pb.FileReference(hashes=[pb.Hash(type=hashlib.sha3_256(b"").digest(),
+                                               value=hashlib.sha3_256(data).digest())],
+                               mime_type="image/png", size_bytes=len(data))
+        files = rpc.FileServiceStub(self.channel)
+        files.UploadFile(iter([pb.UploadFileRequest(file=ref), pb.UploadFileRequest(chunk=data)]))
+        part = pb.ContentPart(image=pb.ImageContent(file=ref))
+        text = pb.ContentPart(text=pb.TextContent(text="/attach hi"))
+        self.stub.SendMessage(pb.SendMessageRequest(content=[text, part]))
+        answer = self.wait_final(2)[1]
+        self.assertEqual([p.WhichOneof("kind") for p in answer.content], ["image", "text"])
+        self.assertEqual(answer.content[0].image.file.hashes, ref.hashes)
+
+    def subscribe_events(self):
+        def gen():
+            yield pb.ClientEvent(subscribe=pb.SubscribeRequest())
+            time.sleep(30)
+
+        call = self.stub.Connect(gen())
+        self.addCleanup(call.cancel)
+        first = next(call)
+        self.assertEqual(first.WhichOneof("event"), "subscription_ready")
+        return call
+
+    def take(self, call, wanted, count):
+        """The next `count` events of the stream for which `wanted(event)` is true."""
+        found = []
+        for event in call:
+            if wanted(event):
+                found.append(event)
+                if len(found) == count:
+                    return found
+        self.fail("the stream ended")
 
 
-def b64(data):
-    return base64.b64encode(data).decode()
-
-
-class ConformanceFixesTest(ServerCase):
-    """Tests 4 and 5, and the body above the limit (sections 4 and 6.2)."""
-
-    def test_4_from_with_a_digit_that_is_not_ascii_is_400_and_keeps_the_connection(self):
-        status, body = self.call("GET", "/chat/messages?from=%C2%B2")
-        self.assertEqual((status, body["error"]), (400, "bad_request"))
-        self.assertEqual(self.call("GET", "/chat/messages")[0], 200)
-
-    def test_5_from_that_is_not_valid_is_400(self):
-        for value in ("", "-1", "1.0", "a"):
-            status, body = self.call("GET", "/chat/messages?from=" + value)
-            self.assertEqual((status, body["error"]), (400, "bad_request"), value)
-
-    def test_a_body_above_the_limit_is_400_and_the_connection_stays_in_step(self):
-        from service.server import MAX_BODY
-        status, body = self.call("POST", "/chat/messages", raw="x" * (MAX_BODY + 10))
-        self.assertEqual((status, body["error"]), (400, "bad_request"))
-        self.assertEqual(self.send("after")[0], 200)
-
-
-class AttachmentTest(ServerCase):
-    """Sections 5.1, 6.1, 6.2, 6.4 and the tests of the files of section 10.1."""
-
-    def setUp(self):
-        super().setUp()
-        self.chat.max_messages = 100
-
-    def get(self, path):
-        self.conn.request("GET", path)
-        response = self.conn.getresponse()
-        return response, response.read()
-
-    def send_files(self, files, text=""):
-        return self.call("POST", "/chat/messages", {"text": text, "attachments": files})
-
-    def history(self, query=""):
-        return self.call("GET", "/chat/messages" + query)[1]
-
-    def png(self, **extra):
-        return {"mime": "image/png", "data": b64(PNG), **extra}
-
-    def test_19_accepts_is_in_each_history_answer(self):
-        _, body = self.call("GET", "/chat/messages")
-        self.assertEqual(body["accepts"], ["image", "audio"])
-        self.send_files([self.png()])
-        _, body = self.call("GET", "/chat/messages?from=2")
-        self.assertEqual(body["accepts"], ["image", "audio"])
-        self.assertEqual(body["messages"], [])
-
-    def test_a_read_answer_is_at_most_1_mib_and_the_client_reads_the_rest(self):
-        text = "\U0001F600" * 4096  # 16 384 bytes; 12 bytes each in JSON: worst case
-        for _ in range(40):
-            self.chat.add("user", text)
-        self.assertGreater(len(json.dumps(self.chat.messages)), 1 << 20)
-        start, seen = 0, []
-        while start < self.chat.count:
-            self.conn.request("GET", "/chat/messages?from=%d" % start)
-            response = self.conn.getresponse()
-            raw = response.read()
-            self.assertEqual(response.status, 200)
-            self.assertLessEqual(len(raw), 1 << 20)
-            body = json.loads(raw)
-            self.assertEqual(body["count"], 40)
-            self.assertEqual(body["accepts"], ["image", "audio"])
-            self.assertGreaterEqual(len(body["messages"]), 1)
-            seen += [m["seq"] for m in body["messages"]]
-            start = seen[-1] + 1
-        self.assertEqual(seen, list(range(40)))
-
-    def test_20_send_only_a_file(self):
-        status, body = self.send_files([self.png()])
-        self.assertEqual(status, 200)
-        self.assertEqual(body["message"], {
-            "seq": 0, "role": "user", "text": "", "status": "done", "attachments": [
-                {"kind": "image", "mime": "image/png", "size": len(PNG)}]})
-        self.assertNotIn("data", json.dumps(body))
-        self.assertEqual(self.history()["messages"][1],
-                         {"seq": 1, "role": "assistant", "text": "", "status": "done",
-                          "reply_to": 0})
-
-    def test_all_accepted_types_and_the_name(self):
-        files = [{"mime": m, "name": "f" + str(i), "data": b64(bytes([i]) * 3)}
-                 for i, m in enumerate(["image/jpeg", "image/png", "audio/mpeg", "audio/wav"])]
-        status, body = self.send_files(files, "look")
-        self.assertEqual(status, 200)
-        self.assertEqual([(a["kind"], a["mime"], a["name"], a["size"])
-                          for a in body["message"]["attachments"]],
-                         [("image", "image/jpeg", "f0", 3), ("image", "image/png", "f1", 3),
-                          ("audio", "audio/mpeg", "f2", 3), ("audio", "audio/wav", "f3", 3)])
-        self.assertEqual(self.history()["messages"][0]["attachments"],
-                         body["message"]["attachments"])
-
-    def test_the_echo_ignores_the_content_of_the_files(self):
-        self.send_files([self.png(), {"mime": "audio/wav", "data": b64(b"RIFF")}], "hello")
-        self.send_files([{"mime": "image/jpeg", "data": b64(b"not a jpeg")}])
-        messages = self.history()["messages"]
-        self.assertEqual(messages[1]["text"], "hello")
-        self.assertNotIn("attachments", messages[1])
-        self.assertEqual(messages[3]["text"], "")
-
-    def test_21_read_the_file_back(self):
-        self.send_files([self.png(), {"mime": "audio/wav", "data": b64(b"\x00\xff")}])
-        response, data = self.get("/chat/messages/0/attachments/0")
-        self.assertEqual((response.status, data), (200, PNG))
-        self.assertEqual(response.getheader("Content-Type"), "image/png")
-        self.assertEqual(response.getheader("Content-Length"), str(len(PNG)))
-        response, data = self.get("/chat/messages/0/attachments/1")
-        self.assertEqual((response.status, data), (200, b"\x00\xff"))
-        self.assertEqual(response.getheader("Content-Type"), "audio/wav")
-
-    def test_22_read_errors(self):
-        self.send_files([self.png()])
-        for path, status in [("/chat/messages/0/attachments/1", 404),
-                             ("/chat/messages/9999/attachments/0", 404),
-                             ("/chat/messages/1/attachments/0", 404),
-                             ("/chat/messages/x/attachments/0", 400),
-                             ("/chat/messages/0/attachments/-1", 400),
-                             ("/chat/messages/0/attachments/%C2%B2", 400)]:
-            response, data = self.get(path)
-            self.assertEqual(response.status, status, path)
-            self.assertEqual(json.loads(data)["error"],
-                             "not_found" if status == 404 else "bad_request")
-
-    def test_23_unsupported_media(self):
-        status, body = self.send_files([self.png(), {"mime": "application/pdf",
-                                                         "data": b64(b"%PDF")}])
-        self.assertEqual((status, body["error"]), (415, "unsupported_media"))
-        self.assertEqual(self.chat.count, 0)
-
-    def test_24_bad_requests_change_nothing(self):
-        too_big = {"mime": "image/png", "data": b64(b"\0" * ((4 << 20) + 1))}
-        for body in [
-                {"text": "x", "attachments": [{"mime": "image/png",
-                                                            "data": "not base64!"}]},
-                {"text": "x", "attachments": [self.png()] * 5},
-                {"text": ""},
-                {"text": "x", "attachments": [too_big]},
-                {"text": "x", "attachments": []},
-                {"text": "", "attachments": []},
-                {"text": "x", "attachments": "no"},
-                {"text": "x", "attachments": [{"mime": "image/png"}]},
-                {"text": "x", "attachments": [{"data": b64(PNG)}]},
-                {"text": "x", "attachments": [self.png(name=5)]}]:
-            status, reply = self.call("POST", "/chat/messages", body)
-            self.assertEqual((status, reply["error"]), (400, "bad_request"), str(body)[:80])
-        self.assertEqual(self.chat.count, 0)
-
-    def test_25_four_files_of_four_mib(self):
-        big = b"\x01" * (4 << 20)
-        files = [{"mime": "audio/mpeg", "data": b64(big)}] * 4
-        status, body = self.send_files(files, "four")
-        self.assertEqual(status, 200)
-        self.assertEqual([a["size"] for a in body["message"]["attachments"]], [4 << 20] * 4)
-        response, data = self.get("/chat/messages/0/attachments/3")
-        self.assertEqual((response.status, data == big), (200, True))
-
-    def test_text_too_long_is_bad_request(self):
-        self.assertEqual(self.send("x" * 16_384)[0], 200)
-        self.assertEqual(self.send("x" * 16_385)[0], 400)
-
-    def test_check_order_the_type_before_the_cid_and_the_room(self):
-        self.send("one", cid="a")
-        status, body = self.send_files([{"mime": "application/pdf", "data": b64(b"a")}])
-        self.assertEqual((status, body["error"]), (415, "unsupported_media"))
-        self.assertEqual(self.chat.files, {})
-
-    def test_the_same_cid_with_files_adds_the_files_once(self):
-        _, first = self.call("POST", "/chat/messages",
-                             {"cid": "f1", "text": "", "attachments": [self.png()]})
-        _, again = self.call("POST", "/chat/messages",
-                             {"cid": "f1", "text": "", "attachments": [self.png()]})
-        self.assertEqual(again["message"], first["message"])
-        self.assertEqual(self.chat.count, 2)
-        self.assertEqual(len(self.chat.files[0]), 1)
-
-    def test_history_full_when_the_files_use_all_the_room(self):
-        self.chat.file_bytes = (64 << 20) - 1
-        status, body = self.send_files([self.png()])
-        self.assertEqual((status, body["error"]), (413, "history_full"))
-        self.assertEqual(self.chat.count, 0)
-
-    def test_15_methods_and_paths(self):
-        for method, path, allow in [("PUT", "/chat/messages", "GET, POST"),
-                                    ("DELETE", "/chat/messages", "GET, POST"),
-                                    ("POST", "/chat/messages/0/attachments/0", "GET"),
-                                    ("PUT", "/chat/messages/0/attachments/0", "GET")]:
-            self.conn.request(method, path, "{}", {"Content-Type": "application/json"})
-            response = self.conn.getresponse()
-            body = json.loads(response.read())
-            self.assertEqual((response.status, body["error"], response.getheader("Allow")),
-                             (405, "method_not_allowed", allow), (method, path))
-        self.assertEqual(self.call("GET", "/chat/other")[0], 404)
-        self.assertEqual(self.call("GET", "/chat/messages/0/other/0")[0], 404)
+class ParseCommandsTest(unittest.TestCase):
+    def test_commands(self):
+        self.assertEqual(parse_commands("/stream=20 /pin hello"), ({"stream": 20, "pin": True}, "hello"))
+        self.assertEqual(parse_commands("/reasoning"), ({"reasoning": True}, ""))
+        self.assertEqual(parse_commands("/delay=5 /pin=late /fail  two  spaces"),
+                         ({"delay": 5, "pin": "late", "fail": True}, " two  spaces"))
+        self.assertEqual(parse_commands("/reject=busy x"), ({"reject": "busy"}, "x"))
+        self.assertEqual(parse_commands("plain /stream"), ({}, "plain /stream"))
+        self.assertEqual(parse_commands("/delay x"), ({}, "/delay x"))
+        self.assertEqual(parse_commands("/pin/stream x"), ({}, "/pin/stream x"))
 
 
 if __name__ == "__main__":

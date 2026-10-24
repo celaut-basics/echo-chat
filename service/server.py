@@ -1,277 +1,225 @@
 #!/usr/bin/env python3
-"""Echo service that follows the chat convention of chatui (docs/celaut/chat.md, revision 5).
+"""Echo service of the chat interface of chatui (docs/celaut/chat.md, revision 6).
 
-One session for each instance. The history is in memory. The answer to a message is
-the text of the message, as a whole answer (`status` `done`): the service adds the user
-message and its answer in the same step and replies at once. The service accepts image
-and audio files, keeps them and gives them back, but it never reads their content: the
-answer has no attachment and does not depend on a file.
+gRPC over HTTP/2 in clear text (h2c) on the port of the slot: `ChatService` and
+`FileService` of chat.proto. The state is in `store.Chat`. Run it as
+`python3 -m service.server` from the directory that holds `service/`.
 """
 
-import base64
-import json
 import os
+import queue
 import re
+import sys
 import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlsplit
+from concurrent import futures
 
-MAX_MESSAGES = 10_000
-MAX_TEXT = 16_384
-MAX_BODY = 24 << 20
-MAX_FILE = 4 << 20
-MAX_FILES = 4
-MAX_ANSWER = 1 << 20  # body of the answer to a read (chat.md section 6.2)
-MAX_FILE_BYTES = 64 << 20  # all files of the history; above it, history_full
-ACCEPTS = ["image", "audio"]
-MIME_KINDS = {"image/jpeg": "image", "image/png": "image",
-              "audio/mpeg": "audio", "audio/wav": "audio"}
+import grpc
 
+from . import chat_pb2 as pb
+from . import chat_pb2_grpc as rpc
+from .store import (ACCEPTED_MIME_TYPES, MAX_FILE, SHA3_256_TYPE, Chat, Reject, bad_request,
+                    normalize_mime, sha3)
 
-class Chat:
-    """The history of the conversation. `count` is the `seq` of the next message."""
-
-    def __init__(self, max_messages=MAX_MESSAGES):
-        self.messages = []
-        self.files = {}  # seq -> list of the bytes of each attachment
-        self.file_bytes = 0
-        self.max_messages = max_messages
-        self.cids = {}  # cid -> the user message of that send
-        self.lock = threading.Lock()  # the data, held for a short time
-
-    @property
-    def count(self):
-        return len(self.messages)
-
-    def add(self, role, text, files=(), **extra):
-        message = {"seq": self.count, "role": role, "text": text, "status": "done", **extra}
-        if files:
-            message["attachments"] = [f["description"] for f in files]
-            self.files[message["seq"]] = [f["data"] for f in files]
-            self.file_bytes += sum(len(f["data"]) for f in files)
-        self.messages.append(message)
-        return message
-
-    def answer(self, text):
-        """The echo of the text only. The files are not an input."""
-        return text
+EVENT_ID = re.compile("[A-Za-z0-9_-]{1,64}")
+CHUNK = 64 << 10  # the size of a chunk that the service sends
+END = object()
 
 
-CID = re.compile("[A-Za-z0-9_-]{1,64}")
-ATTACHMENT = re.compile("/chat/messages/([^/]+)/attachments/([^/]+)")
+def fail(context, error):
+    """End the call with the status and the trailer `chat-reason` (section 9)."""
+    context.set_trailing_metadata((("chat-reason", error.reason),))
+    context.abort(getattr(grpc.StatusCode, error.status), error.message)
 
 
-def _digits(value):
-    return re.fullmatch("[0-9]+", value) is not None
+def protocol_error(error, event_id):
+    return pb.ServerEvent(error=pb.ProtocolError(
+        code=error.reason, message=error.message, event_id=event_id))
 
 
-def _read_files(body):
-    """Check step 1 of the files. Return (files, None) or (None, reason).
+class ChatService(rpc.ChatServiceServicer):
+    def __init__(self, chat):
+        self.chat = chat
 
-    The bytes are decoded to be kept and to know `size`. They are not interpreted.
-    """
-    items = body.get("attachments")
-    if items is None:
-        return [], None
-    if not isinstance(items, list) or not 1 <= len(items) <= MAX_FILES:
-        return None, "attachments needs 1 to %d files" % MAX_FILES
-    files = []
-    for item in items:
-        if (not isinstance(item, dict) or not isinstance(item.get("mime"), str)
-                or not isinstance(item.get("data"), str)
-                or not isinstance(item.get("name", ""), str)):
-            return None, "a file needs a mime and data"
+    def _call(self, context, function, *args):
         try:
-            data = base64.b64decode(item["data"], validate=True)
-        except ValueError:
-            return None, "the data of a file is not valid base64"
-        description = {"mime": item["mime"], "size": len(data)}
-        if "name" in item:
-            description["name"] = item["name"]
-        files.append({"description": description, "data": data})
-    return files, None
+            return function(*args)
+        except Reject as error:
+            fail(context, error)
 
+    def GetCapabilities(self, request, context):
+        return self.chat.capabilities()
 
-class Handler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
-    chat = None
+    def GetConversation(self, request, context):
+        if request.conversation_id:
+            fail(context, Reject("NOT_FOUND", "not_found", "there is only the main conversation"))
+        return self.chat.conversation()
 
-    def log_message(self, fmt, *args):
-        pass
+    def ForkConversation(self, request, context):
+        fail(context, Reject("UNIMPLEMENTED", "unimplemented", "supports_fork is false"))
 
-    def _send(self, status, body):
-        data = json.dumps(body).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+    def SendMessage(self, request, context):
+        return self._call(context, self.chat.send, request)[0]
 
-    def _error(self, status, error, message=None, **extra):
-        body = {"error": error, **extra}
-        if message:
-            body["message"] = message
-        self._send(status, body)
+    def GetMessages(self, request, context):
+        yield from self._call(context, self.chat.get_messages, request)
 
-    def _method_not_allowed(self, allow="GET, POST"):
-        length = self.headers.get("Content-Length", "")
-        if length.isdigit() and int(length) <= MAX_BODY:
-            self.rfile.read(int(length))  # keep the connection in step
-        data = b'{"error": "method_not_allowed"}'
-        self.send_response(405)
-        self.send_header("Allow", allow)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+    def SetMessagePinned(self, request, context):
+        return self._call(context, self.chat.set_pinned, request)
 
-    def _other_method(self):
-        path = urlsplit(self.path).path
-        if path == "/chat/messages":
-            return self._method_not_allowed()
-        if ATTACHMENT.fullmatch(path):
-            return self._method_not_allowed("GET")
-        self._error(404, "not_found")
+    def Connect(self, request_iterator, context):
+        events = queue.Queue()
+        context.add_callback(lambda: events.put(END))  # the client went away
+        seen = set()  # the event_id of each event, to find a repeat
+        state = {"subscribed": False}
 
-    do_PUT = do_DELETE = do_PATCH = do_HEAD = do_OPTIONS = _other_method
+        def end(error):
+            context.set_trailing_metadata((("chat-reason", error.reason),))
+            context.set_code(getattr(grpc.StatusCode, error.status))
+            context.set_details(error.message)
+            events.put(END)
 
-    def _attachment(self, seq, index):
-        if not (_digits(seq) and _digits(index)):
-            return self._error(400, "bad_request", "seq and index are not valid")
-        with self.chat.lock:
-            files = self.chat.files.get(int(seq), [])
-            if int(index) >= len(files):
-                return self._error(404, "not_found")
-            description = self.chat.messages[int(seq)]["attachments"][int(index)]
-            data = files[int(index)]
-        self.send_response(200)
-        self.send_header("Content-Type", description["mime"])
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+        def handle(event):
+            kind = event.WhichOneof("event")
+            if not state["subscribed"] and kind != "subscribe":
+                raise Reject("FAILED_PRECONDITION", "bad_state", "the first event is not subscribe")
+            if event.HasField("event_id"):
+                if not EVENT_ID.fullmatch(event.event_id) or event.event_id in seen:
+                    raise bad_request("event_id is not valid or is not new")
+                seen.add(event.event_id)
+            if kind == "subscribe":
+                if state["subscribed"]:
+                    raise Reject("FAILED_PRECONDITION", "bad_state", "the stream has a subscribe")
+                if event.subscribe.conversation_id:
+                    raise Reject("NOT_FOUND", "not_found", "there is only the main conversation")
+                self.chat.subscribe(events, event.subscribe.after_sequence)
+                state["subscribed"] = True
+            elif kind == "send_message":
+                message, repeat = self.chat.send(event.send_message)
+                if repeat:
+                    self.chat.repeat(events, message)
+            elif kind == "acknowledge":
+                # A hint: the service keeps no events for a stream, so it drops none.
+                self.chat.check_acknowledge(event.acknowledge.last_sequence)
+            elif kind == "cancel_message":
+                raise Reject("UNIMPLEMENTED", "unimplemented", "supports_cancel is false")
+            # Another event is of a newer revision: ignore it.
 
-    def _page(self, start, limit=None):
-        """The messages from `start`, at most `limit`, as many as fit in MAX_ANSWER, at
-        least one.
-
-        The caller holds the data lock. The size is that of the JSON that _send makes.
-        """
-        header = len(json.dumps({"count": self.chat.count, "accepts": ACCEPTS,
-                                 "messages": []}).encode())
-        used = header
-        page = []
-        for message in self.chat.messages[start:]:
-            if limit is not None and len(page) >= limit:
-                break
-            used += len(json.dumps(message).encode()) + 2  # ", " between messages
-            if page and used > MAX_ANSWER:
-                break
-            page.append(message)
-        return page
-
-    def do_GET(self):
-        url = urlsplit(self.path)
-        found = ATTACHMENT.fullmatch(url.path)
-        if found:
-            return self._attachment(*found.groups())
-        if url.path != "/chat/messages":
-            return self._error(404, "not_found")
-        query = parse_qs(url.query, keep_blank_values=True)
-        values = {}
-        for name in ("from", "last", "limit"):
-            if name in query:
-                raw = query[name][0]
-                if not _digits(raw) or (name != "from" and int(raw) == 0):
-                    return self._error(400, "bad_request", name + " is not valid")
-                values[name] = int(raw)
-        if "last" in values and ("from" in values or "limit" in values):
-            return self._error(400, "bad_request", "last cannot go with from or limit")
-        with self.chat.lock:
-            count = self.chat.count
-            start = values.get("from", 0)
-            if start > count:
-                return self._error(400, "bad_request", "from is more than count")
-            if "last" in values:
-                start = max(0, count - values["last"])
-            self._send(200, {"count": count, "accepts": ACCEPTS,
-                             "messages": self._page(start, values.get("limit"))})
-
-    def do_POST(self):
-        path = urlsplit(self.path).path
-        if ATTACHMENT.fullmatch(path):
-            return self._method_not_allowed("GET")
-        if path != "/chat/messages":
-            return self._error(404, "not_found")
-        try:
-            length = int(self.headers.get("Content-Length", ""))
-        except ValueError:
-            length = -1
-        if not 0 <= length <= MAX_BODY:
-            if length > MAX_BODY:
-                # Read and drop the body, so the connection stays in step. A very
-                # large body is not read: the connection closes after the answer.
-                if length <= 4 * MAX_BODY:
-                    self.connection.settimeout(2)
+        def read():
+            try:
+                for event in request_iterator:
                     try:
-                        remaining = length
-                        while remaining:
-                            chunk = self.rfile.read(min(remaining, 1 << 20))
-                            if not chunk:
-                                break
-                            remaining -= len(chunk)
-                    except OSError:
-                        self.close_connection = True
-                    finally:
-                        self.connection.settimeout(None)
-                else:
-                    self.close_connection = True
-            return self._error(400, "bad_request", "the body size is not valid")
-        raw = self.rfile.read(length)
+                        handle(event)
+                    except Reject as error:
+                        if not state["subscribed"]:  # section 6.5, steps 1 and 2
+                            return end(error)
+                        events.put(protocol_error(
+                            error, event.event_id if event.HasField("event_id") else None))
+            except grpc.RpcError:
+                pass
+            events.put(END)  # the client ended its side: end with OK
+
+        threading.Thread(target=read, daemon=True).start()
         try:
-            body = json.loads(raw)
-        except ValueError:
-            body = None
-        cid = body.get("cid") if isinstance(body, dict) else None
-        if (not isinstance(body, dict) or not isinstance(body.get("text"), str)
-                or ("cid" in body and not (isinstance(cid, str) and CID.fullmatch(cid)))):
-            return self._error(400, "bad_request",
-                               "the body needs a text, and a cid of 1 to 64 letters, "
-                               "digits, - or _ if it has one")
-        files, reason = _read_files(body)
-        if reason or not (body["text"] or files):
-            return self._error(400, "bad_request",
-                               reason or "the text is empty and there is no file")
-        if (len(body["text"].encode()) > MAX_TEXT
-                or any(f["description"]["size"] > MAX_FILE for f in files)):
-            return self._error(400, "bad_request", "the text or a file is too big")
-        if any(f["description"]["mime"] not in MIME_KINDS for f in files):
-            return self._error(415, "unsupported_media",
-                               "accepted: " + ", ".join(MIME_KINDS))
-        for f in files:
-            f["description"] = {"kind": MIME_KINDS[f["description"]["mime"]],
-                                **f["description"]}
-        with self.chat.lock:
-            known = self.chat.cids.get(cid) if cid else None
-            if known:  # the same send again: the same message, nothing added
-                return self._send(200, {"count": self.chat.count, "message": known})
-            if (self.chat.count + 2 > self.chat.max_messages
-                    or self.chat.file_bytes + sum(len(f["data"]) for f in files)
-                    > MAX_FILE_BYTES):
-                return self._error(413, "history_full",
-                                   "start a new instance for a new conversation")
-            # The echo is ready at once: the two messages go in together.
-            extra = {"cid": cid} if cid else {}
-            user = self.chat.add("user", body["text"], files, **extra)
-            self.chat.add("assistant", self.chat.answer(body["text"]), reply_to=user["seq"])
-            if cid:
-                self.chat.cids[cid] = user
-            self._send(200, {"count": self.chat.count, "message": user})
+            while True:
+                event = events.get()
+                if event is END:
+                    return
+                yield event
+        finally:
+            self.chat.unsubscribe(events)
+
+
+class FileService(rpc.FileServiceServicer):
+    def __init__(self, chat):
+        self.chat = chat
+
+    def QueryFiles(self, request_iterator, context):
+        kind = None  # the last explicit type of the stream
+        for request in request_iterator:
+            h = request.hash
+            if h.HasField("type"):
+                kind = h.type
+            elif kind is None:
+                fail(context, bad_request("the first hash of the stream needs a type"))
+            known = kind == SHA3_256_TYPE and len(h.value) == 32 and self.chat.has_file(h.value)
+            yield pb.QueryFilesResponse(hash=pb.Hash(type=kind, value=h.value), available=known)
+
+    def UploadFile(self, request_iterator, context):
+        first = next(request_iterator, None)
+        if first is None or first.WhichOneof("part") != "file":
+            fail(context, bad_request("the first message needs a file"))
+        ref = first.file
+        if not ref.HasField("mime_type") or not ref.HasField("size_bytes"):
+            fail(context, bad_request("a file needs mime_type and size_bytes"))
+        try:
+            expected = self.chat.sha3_of(ref)
+        except Reject as error:
+            fail(context, error)
+        mime = normalize_mime(ref.mime_type)
+        if mime not in ACCEPTED_MIME_TYPES:
+            fail(context, Reject("INVALID_ARGUMENT", "unsupported_media",
+                                 "accepted: " + ", ".join(ACCEPTED_MIME_TYPES)))
+        too_large = Reject("INVALID_ARGUMENT", "too_large", "the file is above %d bytes" % MAX_FILE)
+        if ref.size_bytes > MAX_FILE:
+            fail(context, too_large)
+        data = bytearray()
+        for request in request_iterator:
+            if request.WhichOneof("part") != "chunk":
+                fail(context, bad_request("only the first message has a file"))
+            data += request.chunk
+            if len(data) > MAX_FILE:
+                fail(context, too_large)
+        data = bytes(data)
+        if len(data) != ref.size_bytes or sha3(data) != expected:
+            fail(context, Reject("INVALID_ARGUMENT", "hash_mismatch",
+                                 "the bytes do not have the size or the hash that the file gave"))
+        try:
+            self.chat.put_file(expected, data)
+        except Reject as error:
+            fail(context, error)
+        return pb.UploadFileResponse(file=pb.FileReference(
+            hashes=[pb.Hash(type=SHA3_256_TYPE, value=expected)], mime_type=mime,
+            size_bytes=len(data), filename=ref.filename if ref.HasField("filename") else None))
+
+    def DownloadFile(self, request, context):
+        h = request.hash
+        if not h.HasField("type"):
+            fail(context, bad_request("the hash needs a type"))
+        data = self.chat.get_file(h.value) if h.type == SHA3_256_TYPE else None
+        if data is None:
+            fail(context, Reject("NOT_FOUND", "not_found", "the service has no such file"))
+        for start in range(0, len(data), CHUNK):
+            yield pb.DownloadFileResponse(chunk=data[start:start + CHUNK])
+
+
+class Unimplemented(grpc.GenericRpcHandler):
+    """A call that chat.proto does not define ends with UNIMPLEMENTED and its reason."""
+
+    def service(self, details):
+        def handler(request, context):
+            fail(context, Reject("UNIMPLEMENTED", "unimplemented", "the call is not defined"))
+        return grpc.unary_unary_rpc_method_handler(handler)
 
 
 def make_server(host="0.0.0.0", port=8080, chat=None):
-    handler = type("ChatHandler", (Handler,), {"chat": chat or Chat()})
-    return ThreadingHTTPServer((host, port), handler)
+    """Return (server, port, chat). The server is not started."""
+    chat = chat or Chat()
+    server = grpc.server(
+        futures.ThreadPoolExecutor(max_workers=64),
+        options=(("grpc.so_reuseport", 0),
+                 ("grpc.max_receive_message_length", 4 << 20),
+                 ("grpc.max_send_message_length", 1 << 20),
+                 ("grpc.max_concurrent_streams", 100),
+                 ("grpc.http2.max_ping_strikes", 0),  # never close for a PING
+                 ("grpc.keepalive_permit_without_calls", 1)))
+    rpc.add_ChatServiceServicer_to_server(ChatService(chat), server)
+    rpc.add_FileServiceServicer_to_server(FileService(chat), server)
+    server.add_generic_rpc_handlers((Unimplemented(),))  # after the two services
+    return server, server.add_insecure_port("%s:%d" % (host, port)), chat
 
 
 if __name__ == "__main__":
-    make_server(port=int(os.environ.get("PORT", "8080"))).serve_forever()
+    server, port, _ = make_server(port=int(os.environ.get("PORT", "8080")))
+    server.start()
+    print("echo-chat: gRPC on port %d" % port, file=sys.stderr, flush=True)
+    server.wait_for_termination()
