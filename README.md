@@ -27,7 +27,7 @@ TLS and no ALPN.
 | `ChatService.GetMessages` | `after_sequence`, `before_sequence`, `limit` and `last`. The limit of the service is 1000 messages |
 | `ChatService.Connect` | `subscribe` with replay and `SubscriptionReady`, `send_message`, `acknowledge` (checked, a hint), `event_id` and `ProtocolError`. `cancel_message` gets a `ProtocolError` `unimplemented` |
 | `ChatService.SetMessagePinned` | Any message. `updated_at` and `MessagePinnedChanged` only change if the value changes |
-| `ChatService.GetConversation` | The main conversation. A `conversation_id` that is not empty is `NOT_FOUND` |
+| `ChatService.GetConversation` | The main conversation, with its `title` (see below). A `conversation_id` that is not empty is `NOT_FOUND` |
 | `ChatService.ForkConversation` | `UNIMPLEMENTED` |
 | `FileService.QueryFiles`, `UploadFile`, `DownloadFile` | By SHA3-256, in memory (64 MiB in all). Chunks of 64 KiB. Up to 4 files of 4 MiB in one message |
 | Any other call | `UNIMPLEMENTED` |
@@ -61,6 +61,20 @@ so `/etc/passwd` is echoed as it is. `/echo` ends the commands: `/echo /stream a
 | `/delay=MS` | The answer starts MS milliseconds after the send. The service makes the answers one after the other, so a delay makes the queue grow |
 | `/pending` | The answer is made at the send as `PENDING`, and is `IN_PROGRESS` or final when its turn comes |
 | `/reject=REASON` | The send fails and changes nothing: `service_error` (`INTERNAL`), `busy` (`UNAVAILABLE`) or `history_full` (`RESOURCE_EXHAUSTED`) |
+| `/title` | The rest of the text is the new title of the conversation. With no text, the service removes its title |
+
+Suggestions, title and corrector (proposals of chatui issues #88 and #89, `chat.md`
+sections 5.7 and 6.10). A client that does not know them sees no change:
+
+- **Suggestions.** Each `COMPLETED` answer has 3 `suggestions`: the first 3 different words
+  of the user message (2 to 20 letters), and then `Hello`, `Thanks` and `/stream Tell me
+  more`. A streamed answer has them in the `MessageStatusChanged` of `COMPLETED`.
+- **Title.** After the first answer, the title is `Echo: ` and the first 5 words of the
+  first message. `/title` changes it. The title is in `GetConversation`, in
+  `SubscriptionReady` and in a `ConversationTitleChanged` for each change.
+- **Corrector.** The user message keeps the `corrector` of the send. If it has
+  corrections, the answer adds a line after the echo, for example
+  `(corrector: teh → the)`. Without corrections, the answer is the text alone.
 
 Environment variables (the service reads them at start):
 

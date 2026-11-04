@@ -141,6 +141,8 @@ class EchoStreamTest(ServerCase):
         self.send("/pin=late x")
         kinds = []
         for event in events:
+            if event.WhichOneof("event") == "conversation_title_changed":
+                continue  # the title of the first answer (chat.md section 6.10)
             kinds.append(event.WhichOneof("event"))
             if kinds[-1] == "message_pinned_changed":
                 break
@@ -200,6 +202,102 @@ class ParseCommandsTest(unittest.TestCase):
         self.assertEqual(parse_commands("plain /stream"), ({}, "plain /stream"))
         self.assertEqual(parse_commands("/delay x"), ({}, "/delay x"))
         self.assertEqual(parse_commands("/pin/stream x"), ({}, "/pin/stream x"))
+
+
+
+class TitleAndSuggestionsTest(ServerCase):
+    """chat.md sections 5.7 and 6.10 (proposals of chatui issues #88 and #89)."""
+
+    def stream(self):
+        events = []
+
+        def gen():
+            yield pb.ClientEvent(subscribe=pb.SubscribeRequest())
+            time.sleep(30)
+
+        call = self.stub.Connect(gen())
+        self.addCleanup(call.cancel)
+
+        def read():
+            try:
+                for e in call:
+                    events.append(e)
+            except grpc.RpcError:
+                pass
+
+        import threading
+        threading.Thread(target=read, daemon=True).start()
+        return call, events
+
+    def wait_for(self, events, kind, count=1):
+        end = time.time() + 10
+        while time.time() < end:
+            got = [e for e in events if e.WhichOneof("event") == kind]
+            if len(got) >= count:
+                return got
+            time.sleep(0.05)
+        self.fail("no %s" % kind)
+
+    def test_a_whole_answer_suggests_3_words(self):
+        self.send("go to Lisbon in May")
+        user, answer = self.wait_final(2)
+        self.assertEqual(list(answer.suggestions), ["go", "to", "Lisbon"])
+        self.assertEqual(list(user.suggestions), [])
+        self.send("ok")
+        self.assertEqual(list(self.wait_final(4)[3].suggestions), ["ok", "Hello", "Thanks"])
+
+    def test_a_streamed_answer_has_them_with_completed_only(self):
+        call, events = self.stream()
+        self.wait_for(events, "subscription_ready")
+        self.send("/stream=5 one two")
+        done = self.wait_for(events, "message_status_changed")[-1].message_status_changed
+        self.assertEqual(done.status, pb.MESSAGE_STATUS_COMPLETED)
+        self.assertEqual(list(done.suggestions), ["one", "two", "Hello"])
+        self.assertEqual(list(self.wait_final(2)[1].suggestions), ["one", "two", "Hello"])
+        call.cancel()
+
+    def test_the_title_comes_after_the_first_answer_and_with_title(self):
+        self.assertFalse(self.stub.GetConversation(pb.GetConversationRequest()).HasField("title"))
+        call, events = self.stream()
+        ready = self.wait_for(events, "subscription_ready")[0].subscription_ready
+        self.assertFalse(ready.HasField("title"))
+        self.send("plan a trip to Lisbon in May please")
+        changed = self.wait_for(events, "conversation_title_changed")[0].conversation_title_changed
+        self.assertEqual(changed.title, "Echo: plan a trip to Lisbon")
+        self.assertEqual(self.stub.GetConversation(pb.GetConversationRequest()).title, changed.title)
+        # A second answer does not change it; /title does.
+        self.send("again")
+        self.wait_final(4)
+        self.send("/title  Lisbon\tin May ")
+        self.wait_final(6)
+        titles = [e.conversation_title_changed.title
+                  for e in self.wait_for(events, "conversation_title_changed", 2)]
+        self.assertEqual(titles, ["Echo: plan a trip to Lisbon", "Lisbon in May"])
+        call.cancel()
+        # A new stream has it in SubscriptionReady, and no event before it.
+        call, events = self.stream()
+        ready = self.wait_for(events, "subscription_ready")[0].subscription_ready
+        self.assertEqual(ready.title, "Lisbon in May")
+        self.assertFalse(any(e.WhichOneof("event") == "conversation_title_changed" for e in events))
+        call.cancel()
+        # /title with no text removes it.
+        self.send("/title")
+        self.wait_final(8)
+        self.assertFalse(self.stub.GetConversation(pb.GetConversationRequest()).HasField("title"))
+
+    def test_the_corrector_is_kept_and_the_echo_names_the_corrections(self):
+        corrector = pb.CorrectorState(enabled=True, corrections=[pb.Correction(original="teh", replacement="the")])
+        user = self.send("the cat", corrector=corrector)
+        self.assertEqual(body(user), "the cat")
+        user, answer = self.wait_final(2)
+        self.assertEqual(user.corrector, corrector)
+        self.assertEqual(body(answer), "the cat\n\n(corrector: teh \u2192 the)")
+        # Without corrections the echo is the text alone.
+        self.send("plain", corrector=pb.CorrectorState(enabled=True))
+        self.assertEqual(body(self.wait_final(4)[3]), "plain")
+
+    def test_commands_title(self):
+        self.assertEqual(parse_commands("/title My trip"), ({"title": True}, "My trip"))
 
 
 if __name__ == "__main__":

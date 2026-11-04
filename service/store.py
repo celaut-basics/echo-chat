@@ -30,7 +30,14 @@ READ_LIMIT = 1000  # the most messages of one GetMessages
 KEY = re.compile("[A-Za-z0-9_-]{1,64}")
 STATUS = pb.MessageStatus
 
-COMMANDS = ("stream", "reasoning", "pin", "fail", "attach", "delay", "pending", "reject", "echo")
+COMMANDS = ("stream", "reasoning", "pin", "fail", "attach", "delay", "pending", "reject", "title",
+            "echo")
+
+# chat.md section 5.7: the echo proposes up to 3 words of the user message, and fills the
+# rest from these.
+FILL_SUGGESTIONS = ("Hello", "Thanks", "/stream Tell me more")
+WORD = re.compile(r"[^\W\d_]{2,20}")
+TITLE_MAX = 60  # characters; chat.md section 6.10 allows 256 bytes
 REJECTS = ("service_error", "busy", "history_full")
 
 
@@ -77,6 +84,7 @@ def parse_commands(text):
     | `/delay=MS` | The answer starts MS milliseconds after the service takes the message |
     | `/pending` | The answer is `PENDING` from the send until it starts |
     | `/reject=REASON` | The send fails with `service_error`, `busy` or `history_full` |
+    | `/title` | The rest of the text is the new title of the conversation (chat.md 6.10) |
     """
     commands = {}
     rest = text
@@ -118,6 +126,8 @@ class Chat:
         self.files = {}  # SHA3-256 value -> bytes
         self.file_bytes = 0
         self.subscribers = []
+        self.title = None  # chat.md section 6.10
+        self.auto_titled = False  # the title of the first answer is set
         self.pending = 0  # user messages that wait for an answer
         self.lock = threading.Lock()
         self.jobs = queue.Queue()
@@ -154,11 +164,40 @@ class Chat:
         self._publish(message_created=pb.MessageCreated(message=message))
         return message
 
-    def _set_status(self, message, status):
+    def _set_status(self, message, status, suggestions=()):
         message.status = status
         self._touch(message)
+        # The suggestions come one time, with COMPLETED (chat.md section 5.7).
+        if status == STATUS.MESSAGE_STATUS_COMPLETED:
+            message.suggestions.extend(suggestions)
         self._publish(message_status_changed=pb.MessageStatusChanged(
-            message_id=message.message_id, status=status, updated_at=message.updated_at))
+            message_id=message.message_id, status=status, updated_at=message.updated_at,
+            suggestions=suggestions if status == STATUS.MESSAGE_STATUS_COMPLETED else ()))
+
+    def _set_title(self, title):
+        """chat.md section 6.10: one line, at most TITLE_MAX characters. "" removes it."""
+        title = " ".join(title.split())[:TITLE_MAX].strip() or None
+        if title == self.title:
+            return
+        self.title = title
+        self._publish(conversation_title_changed=pb.ConversationTitleChanged(
+            title=title, updated_at=self._now()))
+
+    @staticmethod
+    def suggest(text):
+        """Up to 3 distinct words of the text, then words of FILL_SUGGESTIONS."""
+        out = []
+        for word in WORD.findall(text):
+            if word.lower() not in (w.lower() for w in out):
+                out.append(word)
+            if len(out) == 3:
+                return out
+        for fill in FILL_SUGGESTIONS:
+            if len(out) == 3:
+                break
+            if fill not in out:
+                out.append(fill)
+        return out
 
     def _pin(self, message, pinned):
         if message.pinned == pinned:
@@ -183,7 +222,9 @@ class Chat:
         return pb.Capabilities(accepted_mime_types=ACCEPTED_MIME_TYPES)
 
     def conversation(self):
-        return pb.Conversation(conversation_id="", created_at=self.created_at, archived=False)
+        with self.lock:
+            return pb.Conversation(conversation_id="", created_at=self.created_at, archived=False,
+                                   title=self.title)
 
     def send(self, request):
         """chat.md section 6.1. Return (user message, True if it is a repeat)."""
@@ -254,7 +295,9 @@ class Chat:
                              reply_to_message_id=request.reply_to_message_id
                              if request.HasField("reply_to_message_id") else None,
                              idempotency_key=request.idempotency_key
-                             if request.HasField("idempotency_key") else None)
+                             if request.HasField("idempotency_key") else None,
+                             # Kept as it was sent, for each read (chat.md section 5.7).
+                             corrector=request.corrector if request.HasField("corrector") else None)
             self.pending += 1
             if user.HasField("idempotency_key"):
                 self.keys[user.idempotency_key] = user.message_id
@@ -304,7 +347,7 @@ class Chat:
             for message in self.messages[after_sequence:]:
                 events.put(pb.ServerEvent(message_created=pb.MessageCreated(message=message)))
             events.put(pb.ServerEvent(subscription_ready=pb.SubscriptionReady(
-                latest_sequence=self.latest)))
+                latest_sequence=self.latest, title=self.title)))
             self.subscribers.append(events)
 
     def unsubscribe(self, events):
@@ -372,8 +415,14 @@ class Chat:
                      or self.stream in ("text", "reasoning"))
         reasoning = "reasoning" in commands or self.stream == "reasoning"
         pinned = commands.get("pin") is True
+        suggestions = self.suggest(text)
         with self.lock:
             user = self.by_id[job["user"]]
+            # The echo says which words the corrector of the client changed (chat.md 5.7).
+            fixes = [c for c in user.corrector.corrections if c.original and c.replacement]
+            if fixes:
+                text += "\n\n(corrector: %s)" % ", ".join(
+                    "%s \u2192 %s" % (c.original, c.replacement) for c in fixes[:32])
             parts = [p for p in user.content if p.WhichOneof("kind") != "text"] \
                 if "attach" in commands else []
             if not streaming:
@@ -381,11 +430,12 @@ class Chat:
                 if job["answer"]:
                     answer = self.by_id[job["answer"]]
                     answer.content.extend(content)
-                    self._set_status(answer, STATUS.MESSAGE_STATUS_COMPLETED)
+                    self._set_status(answer, STATUS.MESSAGE_STATUS_COMPLETED, suggestions)
                 else:
                     answer = self._add(content=content, from_service=True, pinned=pinned,
                                        reply_to_message_id=user.message_id,
-                                       status=STATUS.MESSAGE_STATUS_COMPLETED)
+                                       status=STATUS.MESSAGE_STATUS_COMPLETED,
+                                       suggestions=suggestions)
                 answer_id = answer.message_id
             else:
                 if job["answer"]:
@@ -398,7 +448,14 @@ class Chat:
                                        status=STATUS.MESSAGE_STATUS_IN_PROGRESS)
                 answer_id = answer.message_id
         if streaming:
-            self._stream(answer_id, text, commands, reasoning)
+            self._stream(answer_id, text, commands, reasoning, suggestions)
+        with self.lock:
+            # The title: the text of `/title`, else the first words of the first message.
+            if "title" in commands:
+                self._set_title(text)
+            elif not self.auto_titled and self.by_id[answer_id].status == STATUS.MESSAGE_STATUS_COMPLETED:
+                self.auto_titled = True
+                self._set_title("Echo: " + " ".join(text.split()[:5]))
         if commands.get("pin") == "late":
             with self.lock:
                 self._pin(self.by_id[answer_id], True)
@@ -415,7 +472,7 @@ class Chat:
             self._publish(message_delta=pb.MessageDelta(
                 message_id=answer_id, text_append=text, reasoning_append=reasoning))
 
-    def _stream(self, answer_id, text, commands, reasoning):
+    def _stream(self, answer_id, text, commands, reasoning, suggestions=()):
         pause = commands["stream"] if isinstance(commands.get("stream"), int) else self.delay_ms
         words = re.findall(r"\S+\s*|\s+", text)
         if reasoning:
@@ -434,4 +491,4 @@ class Chat:
                 answer.metadata["error"] = "the answer failed because the message has /fail"
                 self._set_status(answer, STATUS.MESSAGE_STATUS_FAILED)
             else:
-                self._set_status(answer, STATUS.MESSAGE_STATUS_COMPLETED)
+                self._set_status(answer, STATUS.MESSAGE_STATUS_COMPLETED, suggestions)
