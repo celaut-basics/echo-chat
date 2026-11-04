@@ -84,12 +84,18 @@ def png(extra=0):
 
 
 class Stream:
-    """A `Connect` stream. `events` has the server events, then None when the call ends."""
+    """A `Connect` stream. `events` has the server events, then None when the call ends.
+
+    `titles` has the `ConversationTitleChanged` events (chat.md section 6.10), apart: a
+    service can send one at any time after `SubscriptionReady`, so the other tests do not
+    see them.
+    """
 
     def __init__(self, stub, pb):
         self.pb = pb
         self.out = queue.Queue()
         self.events = queue.Queue()
+        self.titles = []
         self.error = None
 
         def requests():
@@ -104,6 +110,9 @@ class Stream:
         def read():
             try:
                 for event in self.call:
+                    if event.WhichOneof("event") == "conversation_title_changed":
+                        self.titles.append(event)
+                        continue
                     self.events.put(event)
             except grpc.RpcError as error:
                 self.error = error
