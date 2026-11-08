@@ -188,6 +188,12 @@ node, exported with `nodo export <service id> <dir>` as
 the nodo commit and the tests. Each asset passed an import on a node with a
 clean registry. Import it with `nodo import <file>`.
 
+Latest: [`v2`](https://github.com/celaut-basics/echo-chat/releases/tag/v2), chat.md
+revision 6 round 10, `1e1157.celaut.bee` (linux/amd64, service id
+`1e115709a93aab4982afac9fdd4dbc994499ead3296089eba5937cedc0fe8b7f`). Tested with nodo
+`dev` a97148dd (2026-11-08): conformance 82 passed, 0 failed, 6 skipped. Release `v1`
+follows revision 4 (HTTP/1.1 with JSON) and a client of revision 6 does not use it.
+
 ## Tests
 
     python3 -m unittest discover -s tests -t .
