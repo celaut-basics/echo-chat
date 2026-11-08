@@ -66,6 +66,9 @@ class ChatService(rpc.ChatServiceServicer):
     def SetMessagePinned(self, request, context):
         return self._call(context, self.chat.set_pinned, request)
 
+    def AnswerSecretRequest(self, request, context):
+        return self._call(context, self.chat.answer_secret, request)
+
     def Connect(self, request_iterator, context):
         events = queue.Queue()
         context.add_callback(lambda: events.put(END))  # the client went away
@@ -134,15 +137,16 @@ class FileService(rpc.FileServiceServicer):
         self.chat = chat
 
     def QueryFiles(self, request_iterator, context):
-        kind = None  # the last explicit type of the stream
+        # Each hash has its own type: an empty type is not valid, and the service does not
+        # reuse the type of an earlier hash (chat.md section 6.4, round 5).
         for request in request_iterator:
             h = request.hash
-            if h.HasField("type"):
-                kind = h.type
-            elif kind is None:
-                fail(context, bad_request("the first hash of the stream needs a type"))
-            known = kind == SHA3_256_TYPE and len(h.value) == 32 and self.chat.has_file(h.value)
-            yield pb.QueryFilesResponse(hash=pb.Hash(type=kind, value=h.value), available=known)
+            if not h.type:
+                fail(context, bad_request("each hash needs a type"))
+            if h.type == SHA3_256_TYPE and len(h.value) != 32:
+                fail(context, bad_request("a SHA3-256 hash has 32 bytes"))
+            known = h.type == SHA3_256_TYPE and self.chat.has_file(h.value)
+            yield pb.QueryFilesResponse(hash=pb.Hash(type=h.type, value=h.value), available=known)
 
     def UploadFile(self, request_iterator, context):
         first = next(request_iterator, None)
@@ -183,7 +187,7 @@ class FileService(rpc.FileServiceServicer):
 
     def DownloadFile(self, request, context):
         h = request.hash
-        if not h.HasField("type"):
+        if not h.type:
             fail(context, bad_request("the hash needs a type"))
         data = self.chat.get_file(h.value) if h.type == SHA3_256_TYPE else None
         if data is None:

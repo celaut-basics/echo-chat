@@ -1,6 +1,7 @@
 """The conversation of the echo service: the history, the files and the answers.
 
-chat.md revision 6. Everything that changes the history, and the event that tells about the
+chat.md revision 6, to round 10. The echo sends no secret request (section 5.6), so
+`AnswerSecretRequest` finds none. A FAILED answer has `Message.error` (field 14). Everything that changes the history, and the event that tells about the
 change, happen under one lock. So a `Connect` stream that joins sees a replay and then the
 live events, with none lost and none sent twice (section 6.5, step 3).
 
@@ -164,15 +165,20 @@ class Chat:
         self._publish(message_created=pb.MessageCreated(message=message))
         return message
 
-    def _set_status(self, message, status, suggestions=()):
+    def _set_status(self, message, status, suggestions=(), error=None):
         message.status = status
+        # A FAILED answer has `error`, set one time with the status, in the message and
+        # in its event (chat.md section 5.2).
+        if error is not None:
+            message.error = error[:1024]
         self._touch(message)
         # The suggestions come one time, with COMPLETED (chat.md section 5.7).
         if status == STATUS.MESSAGE_STATUS_COMPLETED:
             message.suggestions.extend(suggestions)
         self._publish(message_status_changed=pb.MessageStatusChanged(
             message_id=message.message_id, status=status, updated_at=message.updated_at,
-            suggestions=suggestions if status == STATUS.MESSAGE_STATUS_COMPLETED else ()))
+            suggestions=suggestions if status == STATUS.MESSAGE_STATUS_COMPLETED else (),
+            error=message.error if error is not None else None))
 
     def _set_title(self, title):
         """chat.md section 6.10: one line, at most TITLE_MAX characters. "" removes it."""
@@ -209,8 +215,11 @@ class Chat:
 
     def sha3_of(self, ref):
         """The SHA3-256 hash of a FileReference, or a Reject."""
+        # Each hash has an explicit type (chat.md section 5.1).
+        if any(not h.type for h in ref.hashes):
+            raise bad_request("each hash needs a type")
         for h in ref.hashes:
-            if h.HasField("type") and h.type == SHA3_256_TYPE:
+            if h.type == SHA3_256_TYPE:
                 if len(h.value) != 32:
                     raise bad_request("a SHA3-256 hash has 32 bytes")
                 return h.value
@@ -329,6 +338,10 @@ class Chat:
                 end = min(end, first + (request.limit or READ_LIMIT) - 1, first + READ_LIMIT - 1)
             return [pb.Message.FromString(m.SerializeToString()) for m in self.messages[first - 1:end]]
 
+    def answer_secret(self, request):
+        """chat.md section 6.9. The echo sends no `SecretRequest`, so step 1 fails always."""
+        raise Reject("NOT_FOUND", "not_found", "the service sends no secret request")
+
     def set_pinned(self, request):
         if request.conversation_id:
             raise Reject("NOT_FOUND", "not_found", "there is only the main conversation")
@@ -404,8 +417,7 @@ class Chat:
                 answer = self._add(from_service=True, reply_to_message_id=job["user"],
                                    status=STATUS.MESSAGE_STATUS_IN_PROGRESS)
             if answer.status in (STATUS.MESSAGE_STATUS_PENDING, STATUS.MESSAGE_STATUS_IN_PROGRESS):
-                answer.metadata["error"] = error
-                self._set_status(answer, STATUS.MESSAGE_STATUS_FAILED)
+                self._set_status(answer, STATUS.MESSAGE_STATUS_FAILED, error=error)
 
     def _answer(self, job):
         commands, text = job["commands"], job["text"]
@@ -488,7 +500,7 @@ class Chat:
         with self.lock:
             answer = self.by_id[answer_id]
             if "fail" in commands:
-                answer.metadata["error"] = "the answer failed because the message has /fail"
-                self._set_status(answer, STATUS.MESSAGE_STATUS_FAILED)
+                self._set_status(answer, STATUS.MESSAGE_STATUS_FAILED,
+                                 error="the answer failed because the message has /fail")
             else:
                 self._set_status(answer, STATUS.MESSAGE_STATUS_COMPLETED, suggestions)

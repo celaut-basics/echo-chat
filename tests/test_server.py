@@ -154,7 +154,33 @@ class EchoStreamTest(ServerCase):
         answer = self.wait_final(2)[1]
         self.assertEqual(answer.status, pb.MESSAGE_STATUS_FAILED)
         self.assertEqual(body(answer), "one two ")
-        self.assertIn("/fail", answer.metadata["error"])
+        # chat.md section 5.2: the reason is in `error` (field 14), not in the metadata.
+        self.assertIn("/fail", answer.error)
+        self.assertNotIn("error", answer.metadata)
+
+    def test_the_event_of_a_failed_answer_has_the_same_error(self):
+        call = self.subscribe_events()
+        self.send("/fail one two three four")
+        event = self.take(call, lambda e: e.WhichOneof("event") == "message_status_changed"
+                          and e.message_status_changed.status == pb.MESSAGE_STATUS_FAILED, 1)[0]
+        self.assertEqual(event.message_status_changed.error, self.wait_final(2)[1].error)
+
+    def test_a_secret_request_that_the_service_did_not_send_is_not_found(self):
+        # chat.md section 6.9, step 1: the echo sends no SecretRequest.
+        with self.assertRaises(grpc.RpcError) as caught:
+            self.stub.AnswerSecretRequest(pb.AnswerSecretRequestRequest(
+                message_id="m", request_id="r", skipped=True))
+        self.assertEqual(caught.exception.code(), grpc.StatusCode.NOT_FOUND)
+        self.assertIn(("chat-reason", "not_found"), caught.exception.trailing_metadata())
+
+    def test_a_hash_with_no_type_makes_the_file_not_valid(self):
+        data = b"\x89PNG\r\n\x1a\n"
+        ref = pb.FileReference(hashes=[pb.Hash(value=hashlib.sha3_256(data).digest())],
+                               mime_type="image/png", size_bytes=len(data))
+        part = pb.ContentPart(image=pb.ImageContent(file=ref))
+        with self.assertRaises(grpc.RpcError) as caught:
+            self.stub.SendMessage(pb.SendMessageRequest(content=[part]))
+        self.assertEqual(caught.exception.code(), grpc.StatusCode.INVALID_ARGUMENT)
 
     def test_attachments_are_echoed_when_asked(self):
         data = b"\x89PNG\r\n\x1a\n" + b"x" * 10

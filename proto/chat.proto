@@ -42,6 +42,12 @@ service ChatService {
   // vida de la instancia.
   rpc GetCapabilities(GetCapabilitiesRequest)
       returns (Capabilities);
+
+  // Revisión 6 (ronda 8, borrador).
+  // Responde a una petición de secreto (SecretRequest) con un valor
+  // o con una omisión. El valor no entra en el historial (chat.md, 6.9).
+  rpc AnswerSecretRequest(AnswerSecretRequestRequest)
+      returns (AnswerSecretRequestResponse);
 }
 
 // ============================================================
@@ -54,9 +60,7 @@ service FileService {
   // Se envía un hash por mensaje y se recibe una respuesta
   // por cada consulta, en el mismo orden.
   //
-  // El primer hash debe incluir type.
-  // Los siguientes pueden omitirlo para reutilizar el último
-  // type explícito del mismo stream cliente-servidor.
+  // Cada hash debe incluir type (ver Hash).
   rpc QueryFiles(stream QueryFilesRequest)
       returns (stream QueryFilesResponse);
 
@@ -174,6 +178,13 @@ message Message {
   // Solo lo tiene un mensaje del usuario, y solo si el envío lo tenía.
   optional string idempotency_key = 13;
 
+  // Revisión 6.
+  // Texto corto y legible del motivo de un fallo, en UTF-8, de 1 KiB
+  // como máximo. El servicio lo fija junto con el estado FAILED y no
+  // lo cambia después. Solo un mensaje del servicio con estado FAILED
+  // lo tiene.
+  optional string error = 14;
+
   // Revisión 6 (ronda 10, propuesta #88).
   // De 0 a 3 respuestas cortas que el servicio propone al usuario después
   // de este mensaje (chat.md, 5.7). Cada una: UTF-8, de 1 a 64 caracteres,
@@ -219,7 +230,7 @@ message CorrectorState {
   // true si el corrector estaba activo mientras el usuario escribió.
   bool enabled = 1;
 
-  // Palabras que el corrector cambió en el texto, en el orden del texto.
+  // Palabras que el corrector cambió en el texto, en el orden de los cambios.
   // De 0 a 32.
   repeated Correction corrections = 2;
 }
@@ -300,6 +311,11 @@ message MessageStatusChanged {
   // Fecha del cambio de estado, en milisegundos Unix.
   int64 updated_at = 4;
 
+  // Revisión 6.
+  // Igual que Message.error. Solo se envía si status es FAILED, y
+  // tiene el mismo valor que Message.error.
+  optional string error = 5;
+
   // Revisión 6 (ronda 10, propuesta #88).
   // Igual que Message.suggestions. Solo se envía si status es COMPLETED,
   // y tiene el mismo valor que Message.suggestions.
@@ -377,6 +393,10 @@ message ConversationTitleChanged {
 }
 
 message ProtocolError {
+  // Motivo del error. Es uno de los nombres de chat.md, sección 9:
+  // bad_request, unsupported_media, too_large, hash_mismatch,
+  // not_found, file_missing, bad_state, history_full, storage_full,
+  // busy, service_error, unimplemented.
   string code = 1;
   string message = 2;
 
@@ -386,6 +406,31 @@ message ProtocolError {
   // event_id.
   optional string event_id = 3;
 }
+
+// ============================================================
+// Secret requests (revisión 6, ronda 8, borrador)
+// ============================================================
+
+message AnswerSecretRequestRequest {
+  // message_id del mensaje que contiene el SecretRequest.
+  string message_id = 1;
+
+  // request_id del SecretRequest.
+  string request_id = 2;
+
+  // Exactamente una de las dos opciones.
+  oneof answer {
+    // Texto de la variable: UTF-8, de 1 a 8 192 bytes, sin byte NUL.
+    string value = 3;
+
+    // true para omitir la petición.
+    bool skipped = 4;
+  }
+}
+
+// Sin campos: la respuesta solo confirma que el servicio tiene el valor
+// o la omisión. Nunca devuelve el valor.
+message AnswerSecretRequestResponse {}
 
 // ============================================================
 // Multimodal content
@@ -398,7 +443,21 @@ message ContentPart {
     ImageContent image = 3;
     AudioContent audio = 4;
     StructuredContent structured = 5;
+    // Revisión 6 (ronda 8, borrador). Solo en un mensaje del asistente COMPLETED.
+    SecretRequest secret_request = 6;
   }
+}
+
+// Revisión 6 (ronda 8, borrador). Petición de un secreto por nombre (chat.md, 5.6).
+message SecretRequest {
+  // Identifica la petición en la instancia. 1 a 64 caracteres: A-Z, a-z, 0-9, - y _.
+  string request_id = 1;
+
+  // Nombre de la variable que el servicio pide. 1 a 128 caracteres: A-Z, a-z, 0-9 y _.
+  string name = 2;
+
+  // Texto para el usuario que explica por qué hace falta. Vacío equivale a ausente.
+  optional string prose = 3;
 }
 
 message TextContent {
@@ -415,9 +474,18 @@ message Hash {
   // Se define como el digest de una entrada vacía calculado
   // con ese algoritmo y esa longitud.
   //
-  // Puede omitirse en QueryFilesRequest para reutilizar el último
-  // type explícito del mismo stream cliente-servidor.
-  optional bytes type = 1;
+  // Revisión 6: en el cable son los bytes crudos del digest (por
+  // ejemplo, 32 bytes para SHA3-256), no su texto hexadecimal. El
+  // hexadecimal solo es la forma en que chat.md escribe esos bytes.
+  //
+  // Revisión 6: type es obligatorio. Se envía siempre de forma
+  // explícita en cada Hash (QueryFilesRequest, QueryFilesResponse,
+  // FileReference, DownloadFileRequest y UploadFile). En proto3 un
+  // campo bytes no tiene presencia: un type vacío equivale a un type
+  // ausente y es un error (bad_request). Un type que no está vacío y
+  // que el servicio no conoce es un algoritmo desconocido, no un error.
+  // El número del campo no cambia: el cable es el mismo que con optional.
+  bytes type = 1;
 
   // Digest del contenido.
   bytes value = 2;
@@ -476,11 +544,7 @@ message StructuredContent {
 
 message QueryFilesRequest {
   // Hash del archivo que se desea consultar.
-  //
-  // Si type está omitido, se utiliza el último type explícito
-  // recibido en un Hash anterior del mismo stream.
-  //
-  // El primer hash del stream debe incluir type.
+  // type debe estar presente explícitamente (ver Hash).
   Hash hash = 1;
 }
 
@@ -554,7 +618,8 @@ message Capabilities {
   // distintas de la principal.
   bool supports_fork = 5;
 
-  // El servicio implementa CancelMessageRequest.
+  // El servicio implementa el evento cancel_message de ClientEvent
+  // (CancelMessageRequest).
   bool supports_cancel = 6;
 }
 

@@ -4,7 +4,9 @@ An echo service of the chat interface of chatui
 ([docs/celaut/chat.md](https://github.com/celaut-project/chatui/blob/master/docs/celaut/chat.md)).
 It is the check of milestone M4: the answer to each message is the text of the message.
 
-It follows revision 6 of `chat.md` (2026-10-24, ASD-STE100): gRPC over HTTP/2 in clear text
+It follows revision 6 of `chat.md` (2026-10-24, ASD-STE100), to round 10 of chatui `master`
+(secret requests of round 8, the title of round 9, suggestions and corrector of round 10):
+gRPC over HTTP/2 in clear text
 (h2c), defined by [`proto/chat.proto`](proto/chat.proto). Revision 5 (HTTP/1.1 with JSON) is
 gone: a client of revision 5 and this service do not work together. `chat.proto` has no
 package, so the calls are `/ChatService/<Method>` and `/FileService/<Method>`.
@@ -29,7 +31,8 @@ TLS and no ALPN.
 | `ChatService.SetMessagePinned` | Any message. `updated_at` and `MessagePinnedChanged` only change if the value changes |
 | `ChatService.GetConversation` | The main conversation, with its `title` (see below). A `conversation_id` that is not empty is `NOT_FOUND` |
 | `ChatService.ForkConversation` | `UNIMPLEMENTED` |
-| `FileService.QueryFiles`, `UploadFile`, `DownloadFile` | By SHA3-256, in memory (64 MiB in all). Chunks of 64 KiB. Up to 4 files of 4 MiB in one message |
+| `ChatService.AnswerSecretRequest` | `NOT_FOUND`, reason `not_found`: the echo sends no `SecretRequest` (section 6.9, step 1) |
+| `FileService.QueryFiles`, `UploadFile`, `DownloadFile` | By SHA3-256, in memory (64 MiB in all). Chunks of 64 KiB. Up to 4 files of 4 MiB in one message. Each `Hash` must have its own `type`: an empty `type` is `bad_request` (round 5) |
 | Any other call | `UNIMPLEMENTED` |
 
 Each error is a gRPC status with the trailer `chat-reason` (section 9): `bad_request`,
@@ -100,7 +103,7 @@ bottom to the top (`chat.md` section 3). `amd64/.service/service.json` and
 ```
 
 `protocol_stack` in an api slot needs nodo PR
-[#549](https://github.com/celaut-project/nodo/pull/549). A nodo without it
+[#549](https://github.com/celaut-project/nodo/pull/549) (in nodo `dev`). A nodo without it
 ignores the key and packs a slot with one empty protocol layer. chatui does not
 show such a service as a chat service. After a pack, check the stack with
 `nodo inspect <service id>` or in the `StartService` answer. A slot with the stack
@@ -109,7 +112,7 @@ show such a service as a chat service. After a pack, check the stack with
 ## The stubs
 
 `service/chat_pb2.py` and `service/chat_pb2_grpc.py` are made from `proto/chat.proto`, a
-copy of `docs/celaut/chat.proto` of chatui (revision 6). To make them again after a change
+copy of `docs/celaut/chat.proto` of chatui `master` (revision 6, round 10). To make them again after a change
 of the file:
 
 ```bash
