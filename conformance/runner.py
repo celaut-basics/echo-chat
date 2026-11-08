@@ -84,12 +84,18 @@ def png(extra=0):
 
 
 class Stream:
-    """A `Connect` stream. `events` has the server events, then None when the call ends."""
+    """A `Connect` stream. `events` has the server events, then None when the call ends.
+
+    `titles` has the `ConversationTitleChanged` events (chat.md section 6.10), apart: a
+    service can send one at any time after `SubscriptionReady`, so the other tests do not
+    see them.
+    """
 
     def __init__(self, stub, pb):
         self.pb = pb
         self.out = queue.Queue()
         self.events = queue.Queue()
+        self.titles = []
         self.error = None
 
         def requests():
@@ -104,6 +110,9 @@ class Stream:
         def read():
             try:
                 for event in self.call:
+                    if event.WhichOneof("event") == "conversation_title_changed":
+                        self.titles.append(event)
+                        continue
                     self.events.put(event)
             except grpc.RpcError as error:
                 self.error = error
@@ -778,14 +787,23 @@ class Conformance:
     def t48(self):
         self.need_attachments()
         a, b = (self.pb.Hash(type=SHA3, value=hashlib.sha3_256(os.urandom(8)).digest()),
-                self.pb.Hash(value=hashlib.sha3_256(os.urandom(8)).digest()))
+                self.pb.Hash(type=SHA3, value=hashlib.sha3_256(os.urandom(8)).digest()))
         first, second = self.query(a, b)
         check(first.hash.type == SHA3 and second.hash.type == SHA3 and not first.available and not second.available)
         check((first.hash.value, second.hash.value) == (a.value, b.value), "the order changed")
 
     def t49(self):
+        # Round 5: the service does not reuse the type of an earlier hash.
         self.need_attachments()
         self.fails(lambda: self.query(self.pb.Hash(value=b"\0" * 32)),
+                   grpc.StatusCode.INVALID_ARGUMENT, "bad_request")
+        self.fails(lambda: self.query(self.pb.Hash(type=SHA3, value=b"\0" * 32),
+                                      self.pb.Hash(value=b"\0" * 32)),
+                   grpc.StatusCode.INVALID_ARGUMENT, "bad_request")
+
+    def t49a(self):
+        self.need_attachments()
+        self.fails(lambda: self.query(self.pb.Hash(type=SHA3, value=b"\0" * 31)),
                    grpc.StatusCode.INVALID_ARGUMENT, "bad_request")
 
     def t50(self):
@@ -798,7 +816,7 @@ class Conformance:
         data = png(150_000)
         ref = self.upload(data, filename="t51.png")
         check(any(h.type == SHA3 and h.value == hashlib.sha3_256(data).digest() for h in ref.hashes))
-        check(all(h.HasField("type") for h in ref.hashes) and ref.size_bytes == len(data))
+        check(all(h.type for h in ref.hashes) and ref.size_bytes == len(data))
         self.s["png"], self.s["png_ref"] = data, ref
 
     def t52(self):
@@ -829,6 +847,15 @@ class Conformance:
                                                        self.pb.UploadFileRequest(chunk=data)])),
                    grpc.StatusCode.INVALID_ARGUMENT, "hash_mismatch")
         check(not self.available(data))
+
+    def t55b(self):
+        self.need_attachments()
+        data = png(100)
+        ref = self.ref(data)
+        ref.hashes[0].type = b""
+        self.fails(lambda: self.files.UploadFile(iter([self.pb.UploadFileRequest(file=ref),
+                                                       self.pb.UploadFileRequest(chunk=data)])),
+                   grpc.StatusCode.INVALID_ARGUMENT, "bad_request")
 
     def t56(self):
         self.need_attachments()
@@ -999,7 +1026,7 @@ class Conformance:
 
     ORDER = ("1 2 3 4 5 6 2_after_a_send 7 8 9 10 11 12 12a 12b 12c 13 14 15 16 17 18 19 20 21 22 23 "
              "24 25 26 27 27a 27b 27c 27d 27e 27f 27g 28 29 30 33 34 35 36 37 38 39 40 41 42 43 44 45 "
-             "46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 "
+             "46 47 48 49 49a 50 51 52 53 54 55 55b 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 "
              "32 31 2_last").split()
 
     def run(self, only=None, out=sys.stdout):

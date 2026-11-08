@@ -61,6 +61,11 @@ class ChatServiceStub(object):
                 request_serializer=chat__pb2.GetCapabilitiesRequest.SerializeToString,
                 response_deserializer=chat__pb2.Capabilities.FromString,
                 )
+        self.AnswerSecretRequest = channel.unary_unary(
+                '/ChatService/AnswerSecretRequest',
+                request_serializer=chat__pb2.AnswerSecretRequestRequest.SerializeToString,
+                response_deserializer=chat__pb2.AnswerSecretRequestResponse.FromString,
+                )
 
 
 class ChatServiceServicer(object):
@@ -132,6 +137,15 @@ class ChatServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def AnswerSecretRequest(self, request, context):
+        """Revisión 6 (ronda 8, borrador).
+        Responde a una petición de secreto (SecretRequest) con un valor
+        o con una omisión. El valor no entra en el historial (chat.md, 6.9).
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_ChatServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -169,6 +183,11 @@ def add_ChatServiceServicer_to_server(servicer, server):
                     servicer.GetCapabilities,
                     request_deserializer=chat__pb2.GetCapabilitiesRequest.FromString,
                     response_serializer=chat__pb2.Capabilities.SerializeToString,
+            ),
+            'AnswerSecretRequest': grpc.unary_unary_rpc_method_handler(
+                    servicer.AnswerSecretRequest,
+                    request_deserializer=chat__pb2.AnswerSecretRequestRequest.FromString,
+                    response_serializer=chat__pb2.AnswerSecretRequestResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -311,6 +330,23 @@ class ChatService(object):
             options, channel_credentials,
             insecure, call_credentials, compression, wait_for_ready, timeout, metadata)
 
+    @staticmethod
+    def AnswerSecretRequest(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(request, target, '/ChatService/AnswerSecretRequest',
+            chat__pb2.AnswerSecretRequestRequest.SerializeToString,
+            chat__pb2.AnswerSecretRequestResponse.FromString,
+            options, channel_credentials,
+            insecure, call_credentials, compression, wait_for_ready, timeout, metadata)
+
 
 class FileServiceStub(object):
     """============================================================
@@ -355,9 +391,7 @@ class FileServiceServicer(object):
         Se envía un hash por mensaje y se recibe una respuesta
         por cada consulta, en el mismo orden.
 
-        El primer hash debe incluir type.
-        Los siguientes pueden omitirlo para reutilizar el último
-        type explícito del mismo stream cliente-servidor.
+        Cada hash debe incluir type (ver Hash).
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
