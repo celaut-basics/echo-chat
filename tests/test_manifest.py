@@ -18,8 +18,8 @@ def _dockerfile(arch):
 
 class ManifestTests(unittest.TestCase):
     def test_one_slot_follows_the_chat_convention(self):
-        # chatui docs/celaut/chat.md section 2: transport tcp, and a protocol stack
-        # with http and, in a layer above it, chat (the rule of chat_slots in chatui).
+        # chatui docs/celaut/chat.md section 3 (revision 6): transport tcp, and the
+        # protocol stack http2, grpc, chat, from the bottom to the top.
         for arch in ARCHES:
             with self.subTest(arch=arch):
                 (slot,) = _service_json(arch)["api"]
@@ -27,8 +27,8 @@ class ManifestTests(unittest.TestCase):
                 self.assertEqual(slot["transport"], "tcp")
                 self.assertNotIn("protocol", slot)
                 layers = [p if isinstance(p, list) else p["tags"] for p in slot["protocol_stack"]]
-                self.assertEqual(layers, [["http"], ["chat"]])
-                self.assertTrue(slot["protocol_stack"][1]["prose"])
+                self.assertEqual(layers, [["http2"], ["grpc"], ["chat"]])
+                self.assertTrue(slot["protocol_stack"][2]["prose"])
 
     def test_the_entrypoint_starts_the_server_on_the_slot_port(self):
         for arch in ARCHES:
@@ -37,7 +37,7 @@ class ManifestTests(unittest.TestCase):
                 dockerfile = _dockerfile(arch)
                 self.assertIn("> /entrypoint.sh", dockerfile)
                 self.assertIn("'export PORT=8080'", dockerfile)
-                self.assertIn("/usr/bin/python3 /service/server.py", dockerfile)
+                self.assertIn("-m service.server", dockerfile)
 
     def test_the_service_needs_no_network_and_little_memory(self):
         for arch in ARCHES:
@@ -48,6 +48,19 @@ class ManifestTests(unittest.TestCase):
                 # Node floors: MIN_MEM_MIB and MIN_ROOTFS_BYTES are 128 MiB (134217728).
                 self.assertGreaterEqual(data["resources"]["at_init"]["mem_limit"], 134217728)
                 self.assertGreaterEqual(data["resources"]["at_init"]["disk_space"], 134217728)
+
+    def test_the_grpc_libraries_are_pinned_to_the_versions_of_requirements_dev(self):
+        requirements = (ROOT / "requirements-dev.txt").read_text()
+        self.assertIn("grpcio==1.51.1", requirements)
+        self.assertIn("protobuf==4.21.12", requirements)  # Debian 3.21.12 is PyPI 4.21.12
+        for arch in ARCHES:
+            dockerfile = _dockerfile(arch)
+            self.assertIn("python3-grpcio=1.51.1-", dockerfile, arch)
+            self.assertIn("python3-protobuf=3.21.12-", dockerfile, arch)
+            for line in dockerfile.splitlines():
+                if line.strip().startswith(("python3", "libpython3", "libprotobuf", "libabsl",
+                                            "libc-ares", "libre2")):
+                    self.assertRegex(line, r"^\s+[a-z0-9.+-]+=\S+ \\$", line)
 
     def test_pack_config_includes_only_service(self):
         for arch in ARCHES:
