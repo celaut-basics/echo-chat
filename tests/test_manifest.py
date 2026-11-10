@@ -17,18 +17,20 @@ def _dockerfile(arch):
 
 
 class ManifestTests(unittest.TestCase):
-    def test_one_slot_follows_the_chat_convention(self):
+    def test_the_chat_slot_and_the_cards_slot(self):
         # chatui docs/celaut/chat.md section 3 (revision 6): transport tcp, and the
-        # protocol stack http2, grpc, chat, from the bottom to the top.
+        # protocol stack http2, grpc, chat, from the bottom to the top. The second slot
+        # is the cards interface (cards.md section 3): http2, grpc, cards.
         for arch in ARCHES:
             with self.subTest(arch=arch):
-                (slot,) = _service_json(arch)["api"]
-                self.assertEqual(slot["port"], 8080)
-                self.assertEqual(slot["transport"], "tcp")
-                self.assertNotIn("protocol", slot)
-                layers = [p if isinstance(p, list) else p["tags"] for p in slot["protocol_stack"]]
-                self.assertEqual(layers, [["http2"], ["grpc"], ["chat"]])
-                self.assertTrue(slot["protocol_stack"][2]["prose"])
+                chat, cards = _service_json(arch)["api"]
+                for slot, port, tag in ((chat, 8080, "chat"), (cards, 8081, "cards")):
+                    self.assertEqual(slot["port"], port)
+                    self.assertEqual(slot["transport"], "tcp")
+                    self.assertNotIn("protocol", slot)
+                    layers = [p if isinstance(p, list) else p["tags"] for p in slot["protocol_stack"]]
+                    self.assertEqual(layers, [["http2"], ["grpc"], [tag]])
+                    self.assertTrue(slot["protocol_stack"][2]["prose"])
 
     def test_the_entrypoint_starts_the_server_on_the_slot_port(self):
         for arch in ARCHES:
@@ -37,6 +39,7 @@ class ManifestTests(unittest.TestCase):
                 dockerfile = _dockerfile(arch)
                 self.assertIn("> /entrypoint.sh", dockerfile)
                 self.assertIn("'export PORT=8080'", dockerfile)
+                self.assertIn("'export CARDS_PORT=8081'", dockerfile)
                 self.assertIn("-m service.server", dockerfile)
 
     def test_the_service_needs_no_network_and_little_memory(self):

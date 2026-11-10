@@ -17,6 +17,7 @@ import grpc
 
 from . import chat_pb2 as pb
 from . import chat_pb2_grpc as rpc
+from .cards import CARDS_PORT, make_cards_server
 from .store import (ACCEPTED_MIME_TYPES, MAX_FILE, SHA3_256_TYPE, Chat, Reject, bad_request,
                     normalize_mime, sha3)
 
@@ -223,7 +224,12 @@ def make_server(host="0.0.0.0", port=8080, chat=None):
 
 
 if __name__ == "__main__":
-    server, port, _ = make_server(port=int(os.environ.get("PORT", "8080")))
+    # The cards slot (cards.md) runs next to the chat slot, on its own port.
+    cards_server, cards_port, deck = make_cards_server(port=CARDS_PORT)
+    server, port, _ = make_server(port=int(os.environ.get("PORT", "8080")),
+                                  chat=Chat(cards=deck, cards_port=cards_port))
+    cards_server.start()
     server.start()
-    print("echo-chat: gRPC on port %d" % port, file=sys.stderr, flush=True)
+    print("echo-chat: gRPC on port %d, cards on port %d" % (port, cards_port),
+          file=sys.stderr, flush=True)
     server.wait_for_termination()
