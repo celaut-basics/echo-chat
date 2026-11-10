@@ -445,7 +445,23 @@ message ContentPart {
     StructuredContent structured = 5;
     // Revisión 6 (ronda 8, borrador). Solo en un mensaje del asistente COMPLETED.
     SecretRequest secret_request = 6;
+    // Revisión 6 (ronda 11, propuesta #120). Solo en un mensaje del asistente
+    // COMPLETED. Apunta a otro slot de la misma instancia (chat.md, 5.8).
+    SlotLink slot_link = 7;
   }
+}
+
+// Revisión 6 (ronda 11, propuesta #120). Un puntero a otro slot de la misma
+// instancia, por ejemplo un mazo de cards.md. El cliente muestra un botón y
+// abre el slot solo cuando el usuario lo toca (chat.md, 5.8).
+message SlotLink {
+  // El port de un Slot del Service.Api de la instancia. Nombra el slot, como
+  // en ServiceTunnel. No es una dirección.
+  uint32 port = 1;
+
+  // Texto del botón: 1 a 32 caracteres, una línea. Ausente: el cliente usa
+  // su propio texto.
+  optional string label = 2;
 }
 
 // Revisión 6 (ronda 8, borrador). Petición de un secreto por nombre (chat.md, 5.6).

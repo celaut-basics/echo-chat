@@ -1,0 +1,255 @@
+syntax = "proto3";
+
+// Interfaz "cards" de Celaut. La especificación normativa está en
+// docs/celaut/cards.md (revisión 1). Si este archivo y cards.md no están de
+// acuerdo, cards.md tiene razón.
+//
+// Un mazo ("deck") es una lista de cartas a pantalla completa. Cada
+// movimiento del usuario (deslizar, tocar un botón, una tecla) es una
+// decisión que va al servicio. La decisión no tiene respuesta y no empieza
+// un turno nuevo del modelo.
+
+// Hash, FileReference e ImageContent son los de chat.proto. Las imágenes de
+// las cartas se leen con FileService de chat.proto (/FileService/DownloadFile),
+// en el mismo slot que CardsService.
+import "chat.proto";
+
+// No hay package: las rutas de las llamadas son /CardsService/<Método>.
+
+// ============================================================
+// Cards service
+// ============================================================
+
+service CardsService {
+  // Estado del mazo en tiempo real. El primer evento es siempre una copia
+  // completa (DeckEvent.deck). Después llegan los cambios, en orden.
+  rpc Watch(WatchRequest) returns (stream DeckEvent);
+
+  // Una decisión del usuario sobre una carta. El servicio la acepta y
+  // contesta sin esperar nada más. Repetir la misma idempotency_key no
+  // cambia nada.
+  rpc SendAction(SendActionRequest) returns (SendActionResponse);
+}
+
+// ============================================================
+// Watch
+// ============================================================
+
+message WatchRequest {}
+
+message DeckEvent {
+  // Versión del estado después de este evento. Crece con cada cambio y nunca
+  // baja durante la vida de la instancia. El cliente ignora un evento cuya
+  // versión no es mayor que la suya.
+  uint64 version = 1;
+
+  // El mazo al que se aplica el evento. En `deck`, es Deck.deck_id.
+  string deck_id = 2;
+
+  oneof event {
+    // Reemplaza todo el estado: el primer evento de Watch, un mazo nuevo,
+    // o una recarga del mismo mazo.
+    Deck deck = 3;
+
+    // Añade cartas.
+    CardsAdded cards_added = 4;
+
+    // Quita cartas.
+    CardsRemoved cards_removed = 5;
+
+    // Mueve una carta.
+    CardMoved card_moved = 6;
+
+    // Reemplaza una carta que ya está en el mazo (mismo item_id).
+    CardChanged card_changed = 7;
+  }
+}
+
+message CardsAdded {
+  // Las cartas nuevas, en orden. Un item_id que ya está en el mazo se ignora.
+  repeated Card cards = 1;
+
+  // Las cartas van antes de esta carta. Ausente, o un item_id que no está:
+  // al final del mazo.
+  optional string before_item_id = 2;
+}
+
+message CardsRemoved {
+  // Las cartas que salen. Un item_id que no está se ignora.
+  repeated string item_ids = 1;
+}
+
+message CardMoved {
+  string item_id = 1;
+
+  // La carta va antes de esta carta. Ausente, o un item_id que no está: al
+  // final del mazo.
+  optional string before_item_id = 2;
+}
+
+message CardChanged {
+  Card card = 1;
+}
+
+// ============================================================
+// Deck and cards
+// ============================================================
+
+message Deck {
+  // Nombre del mazo. 1 a 64 caracteres: A-Z, a-z, 0-9, - y _. Vacío: no hay
+  // mazo (el servicio no tiene nada que mostrar todavía).
+  string deck_id = 1;
+
+  // Título del mazo para el usuario. Una línea.
+  optional string title = 2;
+
+  // Las acciones del mazo: una para cada dirección de deslizar, y botones.
+  repeated DeckAction actions = 3;
+
+  // Las cartas, en el orden en que el usuario las ve.
+  repeated Card cards = 4;
+
+  // El cliente muestra la cuenta ("12 de 30").
+  bool show_progress = 5;
+
+  // Texto para el final del mazo, cuando no quedan cartas sin decisión.
+  optional string end_text = 6;
+}
+
+message DeckAction {
+  // Nombre de la acción. 1 a 64 caracteres: A-Z, a-z, 0-9, - y _. Único en el
+  // mazo.
+  string action_id = 1;
+
+  // Texto del botón. 1 a 32 caracteres, una línea.
+  string label = 2;
+
+  // Icono de la lista fija de cards.md.
+  Icon icon = 3;
+
+  // Color, por su papel; el cliente toma el color del tema.
+  Tone tone = 4;
+
+  // Dirección de deslizar que hace esta acción. DIRECTION_NONE: solo botón.
+  // Dos acciones no tienen la misma dirección.
+  Direction direction = 5;
+}
+
+message Card {
+  // Nombre de la carta. 1 a 64 caracteres: A-Z, a-z, 0-9, - y _. Único en el
+  // mazo y estable: no cambia cuando el servicio recarga el mazo.
+  string item_id = 1;
+
+  // Título. 1 a 256 bytes de UTF-8, una línea.
+  string title = 2;
+
+  // Texto corto bajo el título. Texto plano, 1 024 bytes o menos.
+  optional string text = 3;
+
+  // Imagen. Se lee con FileService cuando hace falta (chat.md, 6.4).
+  optional ImageContent image = 4;
+
+  // Texto de la vista de detalle, que abre un toque. Texto plano, 16 384
+  // bytes o menos.
+  optional string detail = 5;
+
+  // Botones propios de la carta (además de las acciones del mazo).
+  repeated CardButton buttons = 6;
+
+  // Color de la carta, por su papel.
+  Tone tone = 7;
+
+  // Forma de la carta.
+  Layout layout = 8;
+
+  // Grupo de la carta, por ejemplo el pasillo de la tienda. Una línea.
+  optional string group = 9;
+
+  // La decisión que el servicio ya tiene para esta carta (un action_id).
+  // Una carta con decisión está hecha: el cliente no la muestra como la
+  // siguiente.
+  optional string decision = 10;
+}
+
+message CardButton {
+  // La acción que envía el botón. 1 a 64 caracteres: A-Z, a-z, 0-9, - y _.
+  string action_id = 1;
+
+  // Texto del botón. 1 a 32 caracteres, una línea.
+  string label = 2;
+
+  Icon icon = 3;
+  Tone tone = 4;
+}
+
+enum Direction {
+  DIRECTION_NONE = 0;
+  DIRECTION_LEFT = 1;
+  DIRECTION_RIGHT = 2;
+  DIRECTION_UP = 3;
+  DIRECTION_DOWN = 4;
+}
+
+// El conjunto base de colores. Un valor que el cliente no conoce es
+// TONE_NEUTRAL.
+enum Tone {
+  TONE_NEUTRAL = 0;
+  TONE_POSITIVE = 1;
+  TONE_NEGATIVE = 2;
+  TONE_WARNING = 3;
+  TONE_ACCENT = 4;
+}
+
+// El conjunto base de formas. Un valor que el cliente no conoce es
+// LAYOUT_IMAGE_TOP.
+enum Layout {
+  // Imagen arriba (si hay), y el texto debajo.
+  LAYOUT_IMAGE_TOP = 0;
+  // La imagen ocupa la carta y el texto va encima, abajo.
+  LAYOUT_IMAGE_FULL = 1;
+  // Solo texto: el cliente no muestra la imagen.
+  LAYOUT_TEXT = 2;
+}
+
+// La lista fija de iconos. Un valor que el cliente no conoce es ICON_NONE.
+enum Icon {
+  ICON_NONE = 0;
+  ICON_CHECK = 1;
+  ICON_CLOSE = 2;
+  ICON_LATER = 3;
+  ICON_STAR = 4;
+  ICON_CART = 5;
+  ICON_ARCHIVE = 6;
+  ICON_DELETE = 7;
+  ICON_FLAG = 8;
+  ICON_INFO = 9;
+}
+
+// ============================================================
+// Actions
+// ============================================================
+
+message SendActionRequest {
+  // El mazo y la carta. Una carta o un mazo que el servicio ya no tiene no es
+  // un error: el servicio contesta OK y no hace nada (un deslizar tardío).
+  string deck_id = 1;
+  string item_id = 2;
+
+  // La acción (DeckAction.action_id o CardButton.action_id). Con undo, la
+  // acción que se deshace.
+  string action_id = 3;
+
+  // Nombre de esta decisión. 1 a 64 caracteres: A-Z, a-z, 0-9, - y _. Único
+  // para cada decisión del cliente. La misma clave otra vez: OK, sin cambio.
+  string idempotency_key = 4;
+
+  // true: deshace la última decisión de la carta. Es una decisión nueva
+  // sobre la misma carta: la historia solo crece.
+  bool undo = 5;
+
+  // Momento en que el usuario hizo el movimiento, en milisegundos desde
+  // 1970-01-01 UTC. La cola del cliente puede enviarla más tarde.
+  int64 acted_at = 6;
+}
+
+message SendActionResponse {}

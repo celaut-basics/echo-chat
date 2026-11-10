@@ -16,6 +16,18 @@
                     "prose": "Echo service of the chat interface of chatui (docs/celaut/chat.md, revision 6, gRPC over h2c). The answer to each message is the text of the message. One instance is one conversation."
                 }
             ]
+        },
+        {
+            "port": 8081,
+            "transport": "tcp",
+            "protocol_stack": [
+                ["http2"],
+                ["grpc"],
+                {
+                    "tags": ["cards"],
+                    "prose": "Deck of cards of the echo service (chatui docs/celaut/cards.md, revision 1, gRPC over h2c). The chat command /cards makes a shopping list and points to this slot."
+                }
+            ]
         }
     ],
     "resources": {

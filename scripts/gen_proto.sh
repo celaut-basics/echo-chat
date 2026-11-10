@@ -7,6 +7,9 @@
 #   PATH=$PWD/.venv/bin:$PATH scripts/gen_proto.sh
 set -eu
 cd "$(dirname "$0")/.."
-python3 -m grpc_tools.protoc -I proto --python_out=service --grpc_python_out=service proto/chat.proto
-# chat.proto has no package, so the stub imports its module by a bare name.
-sed -i 's/^import chat_pb2 as chat__pb2$/from . import chat_pb2 as chat__pb2/' service/chat_pb2_grpc.py
+python3 -m grpc_tools.protoc -I proto --python_out=service --grpc_python_out=service \
+  proto/chat.proto proto/cards.proto
+# The protos have no package, so the stubs import their modules by a bare name.
+sed -i 's/^import chat_pb2 as chat__pb2$/from . import chat_pb2 as chat__pb2/' \
+  service/chat_pb2_grpc.py service/cards_pb2.py service/cards_pb2_grpc.py
+sed -i 's/^import cards_pb2 as cards__pb2$/from . import cards_pb2 as cards__pb2/' service/cards_pb2_grpc.py

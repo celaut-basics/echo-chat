@@ -32,7 +32,7 @@ KEY = re.compile("[A-Za-z0-9_-]{1,64}")
 STATUS = pb.MessageStatus
 
 COMMANDS = ("stream", "reasoning", "pin", "fail", "attach", "delay", "pending", "reject", "title",
-            "echo")
+            "cards", "echo")
 
 # chat.md section 5.7: the echo proposes up to 3 words of the user message, and fills the
 # rest from these.
@@ -86,6 +86,7 @@ def parse_commands(text):
     | `/pending` | The answer is `PENDING` from the send until it starts |
     | `/reject=REASON` | The send fails with `service_error`, `busy` or `history_full` |
     | `/title` | The rest of the text is the new title of the conversation (chat.md 6.10) |
+    | `/cards` | The deck of the cards slot (cards.md): `/cards`, `/cards refresh` or `/cards new`. The answer has a `slot_link` to the slot (chat.md 5.8) |
     """
     commands = {}
     rest = text
@@ -113,8 +114,12 @@ def parse_commands(text):
 
 
 class Chat:
-    def __init__(self, max_messages=None, max_queue=None, stream=None, delay_ms=None):
+    def __init__(self, max_messages=None, max_queue=None, stream=None, delay_ms=None,
+                 cards=None, cards_port=None):
         env = os.environ.get
+        # The deck of the cards slot (service/cards.py), and the port of that slot.
+        self.cards = cards
+        self.cards_port = cards_port
         self.max_messages = int(env("ECHO_MAX_MESSAGES", 10_000)) if max_messages is None else max_messages
         self.max_queue = int(env("ECHO_MAX_QUEUE", 64)) if max_queue is None else max_queue
         # ECHO_STREAM: "" (whole answers), "text" or "reasoning" for every answer.
@@ -423,8 +428,16 @@ class Chat:
         commands, text = job["commands"], job["text"]
         if commands.get("delay"):
             time.sleep(commands["delay"] / 1000)
-        streaming = (any(c in commands for c in ("stream", "reasoning", "fail"))
-                     or self.stream in ("text", "reasoning"))
+        link = []
+        if "cards" in commands and self.cards is not None:
+            # chat.md 5.8: the answer tells what the slot is for, and points to it.
+            deck_id = self.cards.make(text.strip())
+            text = ("Your shopping list is ready (deck %s). Open it and swipe each item: "
+                    "right when it is in the basket, left for later." % deck_id)
+            link = [pb.ContentPart(slot_link=pb.SlotLink(port=self.cards_port,
+                                                         label="Open the list"))]
+        streaming = not link and (any(c in commands for c in ("stream", "reasoning", "fail"))
+                                  or self.stream in ("text", "reasoning"))
         reasoning = "reasoning" in commands or self.stream == "reasoning"
         pinned = commands.get("pin") is True
         suggestions = self.suggest(text)
@@ -438,7 +451,7 @@ class Chat:
             parts = [p for p in user.content if p.WhichOneof("kind") != "text"] \
                 if "attach" in commands else []
             if not streaming:
-                content = [pb.ContentPart(text=pb.TextContent(text=text))] + parts
+                content = [pb.ContentPart(text=pb.TextContent(text=text))] + parts + link
                 if job["answer"]:
                     answer = self.by_id[job["answer"]]
                     answer.content.extend(content)

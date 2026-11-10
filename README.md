@@ -19,8 +19,8 @@ gives back each file, but it never reads or interprets one.
 
 ## API
 
-One gRPC slot on `:8080` (the `PORT` variable changes it). The server speaks h2c, with no
-TLS and no ALPN.
+One gRPC slot on `:8080` for the chat (the `PORT` variable changes it), and one on `:8081`
+for the deck of cards (`CARDS_PORT`). The server speaks h2c, with no TLS and no ALPN.
 
 | Call | What it does here |
 |---|---|
@@ -65,6 +65,7 @@ so `/etc/passwd` is echoed as it is. `/echo` ends the commands: `/echo /stream a
 | `/pending` | The answer is made at the send as `PENDING`, and is `IN_PROGRESS` or final when its turn comes |
 | `/reject=REASON` | The send fails and changes nothing: `service_error` (`INTERNAL`), `busy` (`UNAVAILABLE`) or `history_full` (`RESOURCE_EXHAUSTED`) |
 | `/title` | The rest of the text is the new title of the conversation. With no text, the service removes its title |
+| `/cards` | Makes the deck "shopping-list" of the cards slot (chatui `docs/celaut/cards.md`, issue #120) and answers with a `slot_link` to that slot (`chat.md` section 5.8). `/cards refresh` sends the same deck again with one more item; `/cards new` makes a new deck. A decision on a card makes no chat message: the service writes it to its log (`cards: <deck> <item> -> <action>`) |
 
 Suggestions, title and corrector (proposals of chatui issues #88 and #89, `chat.md`
 sections 5.7 and 6.10). A client that does not know them sees no change:
@@ -109,10 +110,21 @@ show such a service as a chat service. After a pack, check the stack with
 `nodo inspect <service id>` or in the `StartService` answer. A slot with the stack
 `http`, `chat` (revision 5) does not count for a client of revision 6.
 
+### The cards slot
+
+The second slot, port 8081, has the stack `http2`, `grpc`, `cards` (chatui
+`docs/celaut/cards.md`, revision 1, a proposal of issue #120). It serves
+`CardsService.Watch` (the first event is the deck, then the changes), `CardsService.SendAction`
+(OK at once; a late decision or the same key again is OK and changes nothing; an undo
+clears the decision) and `FileService.DownloadFile` for the images of the cards (small PNGs
+that the service makes). Before `/cards` the deck is empty (no `deck_id`).
+
 ## The stubs
 
-`service/chat_pb2.py` and `service/chat_pb2_grpc.py` are made from `proto/chat.proto`, a
-copy of `docs/celaut/chat.proto` of chatui `master` (revision 6, round 10). To make them again after a change
+`service/chat_pb2.py`, `service/chat_pb2_grpc.py`, `service/cards_pb2.py` and
+`service/cards_pb2_grpc.py` are made from `proto/chat.proto` and `proto/cards.proto`, copies of
+`docs/celaut/chat.proto` (revision 6, round 11) and `docs/celaut/cards.proto` (revision 1) of
+chatui PR #120. To make them again after a change
 of the file:
 
 ```bash

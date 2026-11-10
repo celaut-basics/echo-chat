@@ -56,12 +56,13 @@ RUN chmod 0755 /service \
 
 # The entrypoint (service.json `init.entry_path`). The guest init starts it as
 # PID 1 and as root. It starts the server as the service user, on port 8080 (the
-# slot of service.json). It is written here so that service/ stays the source of
+# chat slot of service.json) and 8081 (the cards slot). It is written here so that service/ stays the source of
 # the server only. The server is a module of the package `service`, so it starts
 # from `/`.
 RUN printf '%s\n' \
         '#!/bin/sh' \
         'export PORT=8080' \
+        'export CARDS_PORT=8081' \
         'cd /' \
         'exec setpriv --reuid 10001 --regid 10001 --clear-groups /usr/bin/python3 -m service.server' \
         > /entrypoint.sh \
